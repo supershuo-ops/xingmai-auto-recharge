@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.6.0
+// @version      5.7.0
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -51,6 +51,7 @@
     scanSnapshotVisibleRows: 6, // 本轮未充值原因默认显示行数，其余点“展开全部”再看。
     staleSpendGuardUntilHour: 3, // 跨天保护：凌晨这个点之前，如果页面花费和昨天总花费几乎一样，判为页面还没切到新一天，不采用。
     staleSpendRatio: 0.95, // 跨天保护判定比例：花费达到昨天总花费的该比例即视为过期读数。
+    autoSyncAccountRoster: true, // 每轮自动查询后，是否自动把读到的子账号同步进名单。
     dingTalkEnabled: true, // 默认开启钉钉通知；实际是否发送还要看工作台里是否填写了机器人地址。
     dingTalkWebhook: '', // 钉钉机器人地址请在工作台「运行设置」填写，不要写在代码里。
     dingTalkSecret: '', // 钉钉加签密钥请在工作台填写；没开加签就留空。
@@ -98,9 +99,13 @@
   const STORAGE_SKIP_REASON_STATS = 'jxj_yanyuan_recharge_skip_reason_stats_auto_v23';
   const STORAGE_SKIP_REASON_STATE = 'jxj_yanyuan_recharge_skip_reason_state_auto_v23';
   const STORAGE_SKIP_REASON_CHANGES = 'jxj_yanyuan_recharge_skip_reason_changes_auto_v23';
+  const STORAGE_ACCOUNT_ROSTER = 'jxj_yanyuan_recharge_account_roster_auto_v23';
+  const STORAGE_ACCOUNT_GROUPS = 'jxj_yanyuan_recharge_account_groups_auto_v23';
+
+  const UNGROUPED_ID = 'ungrouped'; // 未分组的固定分组ID，不能删除。
 
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.6.0';
+  const SCRIPT_VERSION = '5.7.0';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -108,6 +113,21 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.7.0',
+      date: '2026-08-20',
+      type: 'feature',
+      title: '子账号名单、账号分组和逐级额度分配',
+      items: [
+        '左侧导航按设置顺序排列：① 店铺预算 → ② 分时预算 → ③ 子账号与分组 → ④ 分组与账号额度 → ⑤ 充值规则',
+        '新增「子账号与分组」页：一键从页面拉取本店所有子账号，存成名单并可自定义分组',
+        '新增「分组与账号额度」页：分组和单账号都能设额度，支持按店铺预算百分比或固定金额',
+        '额度从大到小卡：店铺当天预算 → 当前分时上限 → 分组额度 → 账号当天上限，取最小',
+        '条件从小到大找：账号单独设置 > 所在分组 > 全店规则',
+        '未充值原因会写清是哪一级挡住的，例如「被分组额度挡住」',
+        '各分组额度合计超过店铺预算只提示，仍可保存，实际以上一级为硬上限'
+      ]
+    },
     {
       version: '5.6.0',
       date: '2026-08-20',
@@ -1289,6 +1309,7 @@
     }
 
     const candidates = [];
+    const override = resolveAccountCondition(account.accountName);
     let thresholdRuleCount = 0;
 
     for (const rule of rules) {
@@ -1311,6 +1332,10 @@
         amount = Number(timeSlot.amount || amount);
         minRoi = Number(timeSlot.minRoi);
       }
+
+      // 账号单独设置优先于分组，分组优先于规则本身。
+      if (override.amount !== null) amount = override.amount;
+      if (override.minRoi !== null) minRoi = override.minRoi;
 
       if (!(account.balance < rule.minBalance)) {
         candidates.push({
@@ -1692,6 +1717,8 @@
   const SKIP_COOLDOWN = '充值冷却中';
   const SKIP_SLOT_BUDGET = '超出时段累计上限';
   const SKIP_DAILY_BUDGET = '超出当日推广预算';
+  const SKIP_GROUP_QUOTA = '超出分组额度';
+  const SKIP_ACCOUNT_CAP = '超出账号当天上限';
   const SKIP_IN_QUEUE = '已在充值队列中';
   const SKIP_RECENT_TASK = '刚投递过，防重复';
   const SKIP_FAILED_COOLDOWN = '失败冷却中';
@@ -1700,6 +1727,8 @@
   const SKIP_REASON_PRIORITY = [
     SKIP_DAILY_BUDGET,
     SKIP_SLOT_BUDGET,
+    SKIP_GROUP_QUOTA,
+    SKIP_ACCOUNT_CAP,
     SKIP_FAILED_COOLDOWN,
     SKIP_IN_QUEUE,
     SKIP_RECENT_TASK,
@@ -1812,6 +1841,277 @@
     writeJsonValue(STORAGE_SKIP_REASON_STATE, state);
     setSkipReasonChanges(changes);
     refreshRechargeLogPanel();
+  }
+
+  // =========================
+  // 子账号名单与分组
+  // 名单来自京小洁页面，分组只是给子账号打标签，用来做第 4 级额度分配。
+  // =========================
+  function defaultAccountGroups() {
+    return [
+      { id: UNGROUPED_ID, name: '未分组', quotaMode: 'none', quotaValue: 0, amount: null, minRoi: null }
+    ];
+  }
+
+  function normalizeAccountGroup(group) {
+    const item = group || {};
+    const mode = ['percent', 'fixed', 'none'].indexOf(item.quotaMode) >= 0 ? item.quotaMode : 'none';
+    const value = Math.max(0, Number(item.quotaValue || 0));
+
+    return {
+      id: String(item.id || makeLogId()),
+      name: String(item.name || '未命名分组').trim() || '未命名分组',
+      quotaMode: mode,
+      quotaValue: mode === 'percent' ? Math.min(1000, value) : value,
+      amount: item.amount === null || item.amount === '' || item.amount === undefined ? null : Math.max(0, Number(item.amount)),
+      minRoi: item.minRoi === null || item.minRoi === '' || item.minRoi === undefined ? null : Math.max(0, Number(item.minRoi))
+    };
+  }
+
+  function getAccountGroups() {
+    const saved = readJsonValue(STORAGE_ACCOUNT_GROUPS, null);
+    const list = Array.isArray(saved) && saved.length ? saved.map(normalizeAccountGroup) : defaultAccountGroups();
+
+    if (!list.some(group => group.id === UNGROUPED_ID)) {
+      list.unshift(defaultAccountGroups()[0]);
+    }
+
+    // 未分组固定排在最前面。
+    return list.sort((a, b) => (a.id === UNGROUPED_ID ? -1 : b.id === UNGROUPED_ID ? 1 : 0));
+  }
+
+  function saveAccountGroups(groups) {
+    writeJsonValue(STORAGE_ACCOUNT_GROUPS, (groups || []).map(normalizeAccountGroup));
+  }
+
+  function getAccountGroup(groupId) {
+    const groups = getAccountGroups();
+    return groups.find(group => group.id === groupId) || groups.find(group => group.id === UNGROUPED_ID);
+  }
+
+  function normalizeRosterAccount(account) {
+    const item = account || {};
+    const optionalNumber = value =>
+      value === null || value === '' || value === undefined ? null : Math.max(0, Number(value));
+
+    return {
+      accountName: String(item.accountName || '').trim(),
+      groupId: String(item.groupId || UNGROUPED_ID),
+      dailyCap: optionalNumber(item.dailyCap),
+      amount: optionalNumber(item.amount),
+      minRoi: optionalNumber(item.minRoi),
+      balance: Number(item.balance || 0),
+      spend: Number(item.spend || 0),
+      roi: Number(item.roi || 0),
+      updatedAt: Number(item.updatedAt || 0)
+    };
+  }
+
+  function getAccountRoster() {
+    const saved = readJsonValue(STORAGE_ACCOUNT_ROSTER, null);
+    const list = Array.isArray(saved && saved.accounts) ? saved.accounts : [];
+    const groupIds = getAccountGroups().map(group => group.id);
+
+    return list
+      .map(normalizeRosterAccount)
+      .filter(item => item.accountName)
+      .map(item => (groupIds.indexOf(item.groupId) >= 0 ? item : Object.assign({}, item, { groupId: UNGROUPED_ID })));
+  }
+
+  function getAccountRosterMeta() {
+    const saved = readJsonValue(STORAGE_ACCOUNT_ROSTER, null);
+    return {
+      time: Number((saved && saved.time) || 0),
+      count: getAccountRoster().length
+    };
+  }
+
+  function saveAccountRoster(accounts, options) {
+    writeJsonValue(STORAGE_ACCOUNT_ROSTER, {
+      time: (options && options.keepTime) ? getAccountRosterMeta().time : Date.now(),
+      accounts: (accounts || []).map(normalizeRosterAccount).filter(item => item.accountName)
+    });
+  }
+
+  function findRosterAccount(accountName) {
+    const key = normalizeText(accountName);
+    if (!key) return null;
+    return getAccountRoster().find(item => normalizeText(item.accountName) === key) || null;
+  }
+
+  // 把页面读到的子账号并进名单，保留已有的分组和额度设置。
+  function mergeAccountsIntoRoster(accounts) {
+    const list = (accounts || []).filter(item => item && item.accountName);
+    if (!list.length) return { added: 0, updated: 0 };
+
+    const roster = getAccountRoster();
+    const indexByName = new Map(roster.map((item, index) => [normalizeText(item.accountName), index]));
+    const now = Date.now();
+    let added = 0;
+    let updated = 0;
+
+    list.forEach(account => {
+      const key = normalizeText(account.accountName);
+      const patch = {
+        balance: Number(account.balance || 0),
+        spend: Number(account.spend || 0),
+        roi: Number(account.roi || 0),
+        updatedAt: now
+      };
+
+      if (indexByName.has(key)) {
+        roster[indexByName.get(key)] = normalizeRosterAccount(Object.assign({}, roster[indexByName.get(key)], patch));
+        updated += 1;
+        return;
+      }
+
+      roster.push(normalizeRosterAccount(Object.assign({
+        accountName: account.accountName,
+        groupId: UNGROUPED_ID
+      }, patch)));
+      indexByName.set(key, roster.length - 1);
+      added += 1;
+    });
+
+    saveAccountRoster(roster);
+    return { added, updated };
+  }
+
+  function getGroupAccountNames(groupId) {
+    return getAccountRoster()
+      .filter(item => item.groupId === groupId)
+      .map(item => item.accountName);
+  }
+
+  // 分组当天额度：百分比按店铺当天预算折算，固定金额直接用，none 表示不限。
+  function getGroupDailyQuota(group, settings) {
+    const item = group || getAccountGroup(UNGROUPED_ID);
+    if (item.quotaMode === 'none') return null;
+    if (item.quotaMode === 'fixed') return Math.max(0, Number(item.quotaValue || 0));
+
+    const budget = getDailyBudgetAmount(settings || getBudgetSettings());
+    if (!(budget > 0)) return null;
+    return budget * Math.max(0, Number(item.quotaValue || 0)) / 100;
+  }
+
+  // 分组沿用店铺那套分时比例，不单独配置。
+  function getGroupSlotQuota(group, settings, slot) {
+    const daily = getGroupDailyQuota(group, settings);
+    if (daily === null) return null;
+
+    const item = settings || getBudgetSettings();
+    const currentSlot = slot || getCurrentBudgetSlot(item);
+    const percent = Number((currentSlot && currentSlot.percent) || 0);
+    if (!(percent > 0)) return 0;
+
+    return daily * percent / 100;
+  }
+
+  // 一次扫完当天日志，避免每个账号都重新遍历一遍。
+  function getTodaySubmittedAmountMap() {
+    const today = todayKey();
+    const map = new Map();
+
+    getRechargeLogs().forEach(log => {
+      if (!log || !isSubmittedRechargeLog(log)) return;
+      if (todayKeyFromTime(log.time) !== today) return;
+      const key = normalizeText(log.accountName);
+      map.set(key, Number(map.get(key) || 0) + Number(log.amount || 0));
+    });
+
+    return map;
+  }
+
+  function getTodaySubmittedAmountByAccount(accountName, submittedMap) {
+    const map = submittedMap || getTodaySubmittedAmountMap();
+    return Number(map.get(normalizeText(accountName)) || 0);
+  }
+
+  function getPendingAmountByAccount(accountName, excludeAccountName) {
+    const key = normalizeText(accountName);
+    if (excludeAccountName && normalizeText(excludeAccountName) === key) return 0;
+
+    const rows = [];
+    const current = getCurrent();
+    if (current) rows.push(current);
+    getQueue().forEach(item => rows.push(item));
+
+    return rows.reduce((sum, item) => {
+      if (!item || normalizeText(item.accountName) !== key) return sum;
+      return sum + Number(item.amount || 0);
+    }, 0);
+  }
+
+  function getGroupUsedAmount(groupId, options) {
+    const exclude = options && options.excludeAccountName;
+    const includePending = !options || options.includePending !== false;
+    const submittedMap = (options && options.submittedMap) || getTodaySubmittedAmountMap();
+
+    return getGroupAccountNames(groupId).reduce((sum, name) => {
+      const submitted = getTodaySubmittedAmountByAccount(name, submittedMap);
+      const pending = includePending ? getPendingAmountByAccount(name, exclude) : 0;
+      return sum + submitted + pending;
+    }, 0);
+  }
+
+  function getAccountUsedAmount(accountName, options) {
+    const exclude = options && options.excludeAccountName;
+    const includePending = !options || options.includePending !== false;
+    const submittedMap = (options && options.submittedMap) || getTodaySubmittedAmountMap();
+    const submitted = getTodaySubmittedAmountByAccount(accountName, submittedMap);
+    const pending = includePending ? getPendingAmountByAccount(accountName, exclude) : 0;
+    return submitted + pending;
+  }
+
+  // 第 3 / 第 4 级：分组额度和账号当天上限，返回还能充多少以及是谁卡住的。
+  function evaluateAccountAllocation(accountName, options) {
+    const settings = (options && options.settings) || getBudgetSettings();
+    const slot = (options && options.slot) || getCurrentBudgetSlot(settings);
+    const rosterAccount = findRosterAccount(accountName);
+    const group = getAccountGroup(rosterAccount ? rosterAccount.groupId : UNGROUPED_ID);
+    const groupQuota = getGroupSlotQuota(group, settings, slot);
+    const groupUsed = groupQuota === null ? 0 : getGroupUsedAmount(group.id, options);
+    const groupRemaining = groupQuota === null ? null : Math.max(0, groupQuota - groupUsed);
+    const accountCap = rosterAccount && rosterAccount.dailyCap !== null ? Number(rosterAccount.dailyCap) : null;
+    const accountUsed = accountCap === null ? 0 : getAccountUsedAmount(accountName, options);
+    const accountRemaining = accountCap === null ? null : Math.max(0, accountCap - accountUsed);
+
+    return {
+      group,
+      rosterAccount,
+      groupQuota,
+      groupUsed,
+      groupRemaining,
+      accountCap,
+      accountUsed,
+      accountRemaining
+    };
+  }
+
+  // 条件覆盖：账号单独设置 > 所在分组 > 全店规则。
+  function resolveAccountCondition(accountName) {
+    const rosterAccount = findRosterAccount(accountName);
+    const group = getAccountGroup(rosterAccount ? rosterAccount.groupId : UNGROUPED_ID);
+    const result = { amount: null, minRoi: null, amountSource: '', minRoiSource: '', group, rosterAccount };
+
+    if (group && group.amount !== null) {
+      result.amount = group.amount;
+      result.amountSource = `分组「${group.name}」`;
+    }
+    if (group && group.minRoi !== null) {
+      result.minRoi = group.minRoi;
+      result.minRoiSource = `分组「${group.name}」`;
+    }
+    if (rosterAccount && rosterAccount.amount !== null) {
+      result.amount = rosterAccount.amount;
+      result.amountSource = '账号单独设置';
+    }
+    if (rosterAccount && rosterAccount.minRoi !== null) {
+      result.minRoi = rosterAccount.minRoi;
+      result.minRoiSource = '账号单独设置';
+    }
+
+    return result;
   }
 
   function makeSkipRow(account, reason, extraDetail) {
@@ -2250,31 +2550,51 @@
     const skipped = [];
     const messages = [];
 
+    // 店铺这一级放行时，分组额度和账号上限仍然要卡。
+    const passShopLevel = () => {
+      const allocated = applyGroupAndAccountQuota(list, decision, options);
+      return {
+        tasks: allocated.tasks,
+        skipped: skipped.concat(allocated.skipped),
+        messages: messages.concat(allocated.messages),
+        decision
+      };
+    };
+
     if (!decision.active) {
       if (decision.settings.enabled === false) {
-        messages.push('店铺预算控制已关闭，本次不限制充值金额');
+        messages.push('店铺预算控制已关闭，本次不限制店铺总额，仍按分组额度和账号上限控制');
       } else {
-        messages.push('尚未填写近七天平均业绩和合计费比，本次不限制充值金额');
+        messages.push('尚未填写近七天平均业绩和合计费比，本次不限制店铺总额，仍按分组额度和账号上限控制');
       }
-      return { tasks: list, skipped, messages, decision };
+      return passShopLevel();
     }
 
     if (decision.canExceed) {
-      messages.push(`店铺投产达标（${formatRatio(decision.metrics && decision.metrics.roi)} ≥ ${formatRatio(decision.settings.targetShopRoi)}），允许超过当前时段上限 ${formatMoney(decision.slotBudget)} 元和当天预算 ${formatMoney(decision.budget)} 元`);
-      return { tasks: list, skipped, messages, decision };
+      messages.push(`店铺投产达标（${formatRatio(decision.metrics && decision.metrics.roi)} ≥ ${formatRatio(decision.settings.targetShopRoi)}），允许超过当前时段上限 ${formatMoney(decision.slotBudget)} 元和当天预算 ${formatMoney(decision.budget)} 元；分组额度和账号上限仍然生效`);
+      return passShopLevel();
     }
 
     if (!(decision.cap > 0) && !decision.canExceed) {
       const slotText = decision.slot ? `，当前时段 ${formatSlotRange(decision.slot)} 上限 ${formatMoney(decision.slotBudget)} 元` : '';
       messages.push(`当日推广预算为 ${formatMoney(decision.budget)} 元${slotText}，且投产未达标，本次不投递充值任务`);
-      return { tasks: [], skipped: list, messages, decision };
+      return {
+        tasks: [],
+        skipped: list.map(task => Object.assign({}, task, {
+          skipReason: `超出当前时段 ${formatSlotRange(decision.slot)} 预算上限`,
+          skipLevel: 'slot'
+        })),
+        messages,
+        decision
+      };
     }
 
     let remaining = decision.remaining;
     const kept = [];
-    const skipReason = decision.used >= decision.budget
+    const shopSkipReason = decision.used >= decision.budget
       ? '超出当日推广预算'
       : `超出当前时段 ${formatSlotRange(decision.slot)} 预算上限`;
+    const shopSkipLevel = decision.used >= decision.budget ? 'daily' : 'slot';
 
     for (const task of list) {
       const amount = Number(task.amount || 0);
@@ -2299,7 +2619,8 @@
       }
 
       skipped.push(Object.assign({}, task, {
-        skipReason
+        skipReason: shopSkipReason,
+        skipLevel: shopSkipLevel
       }));
     }
 
@@ -2310,7 +2631,104 @@
       messages.push(`${slotText}，已用 ${formatMoney(decision.counted)} 元，当前可充值 ${formatMoney(Math.max(0, remaining))} 元`);
     }
 
-    return { tasks: kept, skipped, messages, decision };
+    const allocated = applyGroupAndAccountQuota(kept, decision, options);
+    return {
+      tasks: allocated.tasks,
+      skipped: skipped.concat(allocated.skipped),
+      messages: messages.concat(allocated.messages),
+      decision
+    };
+  }
+
+  // 第 3 / 第 4 级：分组额度和账号当天上限。店铺和分时已经卡过一轮，这里继续往下卡。
+  function applyGroupAndAccountQuota(tasks, decision, options) {
+    const list = (tasks || []).filter(item => item && item.accountName);
+    const kept = [];
+    const skipped = [];
+    const messages = [];
+
+    if (!list.length) return { tasks: kept, skipped, messages };
+
+    const settings = decision.settings;
+    const slot = decision.slot;
+    const groupRemaining = new Map();
+    const accountRemaining = new Map();
+
+    for (const task of list) {
+      const info = evaluateAccountAllocation(task.accountName, {
+        settings,
+        slot,
+        excludeAccountName: options && options.excludeAccountName,
+        includePending: !options || options.includePending !== false
+      });
+
+      const groupKey = info.group.id;
+      const accountKey = normalizeText(task.accountName);
+
+      if (info.groupRemaining !== null && !groupRemaining.has(groupKey)) {
+        groupRemaining.set(groupKey, info.groupRemaining);
+      }
+      if (info.accountRemaining !== null && !accountRemaining.has(accountKey)) {
+        accountRemaining.set(accountKey, info.accountRemaining);
+      }
+
+      const limits = [];
+      if (groupRemaining.has(groupKey)) {
+        limits.push({
+          level: 'group',
+          value: groupRemaining.get(groupKey),
+          reason: SKIP_GROUP_QUOTA,
+          text: `分组「${info.group.name}」当前时段额度 ${formatMoney(info.groupQuota)} 元，已用 ${formatMoney(info.groupUsed)} 元`
+        });
+      }
+      if (accountRemaining.has(accountKey)) {
+        limits.push({
+          level: 'account',
+          value: accountRemaining.get(accountKey),
+          reason: SKIP_ACCOUNT_CAP,
+          text: `账号当天上限 ${formatMoney(info.accountCap)} 元，已用 ${formatMoney(info.accountUsed)} 元`
+        });
+      }
+
+      if (!limits.length) {
+        kept.push(task);
+        continue;
+      }
+
+      const tightest = limits.reduce((a, b) => (a.value <= b.value ? a : b));
+      const amount = Number(task.amount || 0);
+      const deduct = value => {
+        if (groupRemaining.has(groupKey)) groupRemaining.set(groupKey, Math.max(0, groupRemaining.get(groupKey) - value));
+        if (accountRemaining.has(accountKey)) accountRemaining.set(accountKey, Math.max(0, accountRemaining.get(accountKey) - value));
+      };
+
+      if (amount <= tightest.value) {
+        deduct(amount);
+        kept.push(task);
+        continue;
+      }
+
+      if (tightest.value >= 1) {
+        const adjustedAmount = Math.floor(tightest.value);
+        deduct(adjustedAmount);
+        kept.push(Object.assign({}, task, {
+          amount: adjustedAmount,
+          originalAmount: amount,
+          budgetAdjusted: true,
+          triggerReason: `${task.triggerReason || '余额/ROI规则'}（${tightest.level === 'group' ? '分组额度' : '账号上限'}截断 ${formatMoney(amount)}→${formatMoney(adjustedAmount)}）`
+        }));
+        messages.push(`${task.accountName} 受${tightest.level === 'group' ? '分组额度' : '账号当天上限'}限制，充值金额从 ${formatMoney(amount)} 元调整为 ${formatMoney(adjustedAmount)} 元`);
+        continue;
+      }
+
+      skipped.push(Object.assign({}, task, {
+        skipReason: `${tightest.reason}：${tightest.text}`,
+        skipLevel: tightest.level
+      }));
+      messages.push(`${task.accountName} 被${tightest.level === 'group' ? '分组额度' : '账号当天上限'}挡住：${tightest.text}`);
+    }
+
+    return { tasks: kept, skipped, messages };
   }
 
   function gateTaskByDailyBudget(task) {
@@ -2441,10 +2859,455 @@
     return `<span style="color:#b45309;">保存前请检查：${issues.map(escapeHtml).join('；')}</span>`;
   }
 
+  // =========================
+  // ③ 子账号与分组
+  // =========================
+  function accountRosterPageHtml() {
+    return `
+      ${workspaceStepBarHtml('accounts')}
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
+        第 3 步：把这个店的子账号从页面拉下来存成名单，再按需要分组。分好组，第 4 步才能按组分配额度。
+      </div>
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+          <button type="button" data-action="pull-accounts" style="padding:7px 12px;border:1px solid #0f766e;background:#fff;color:#0f766e;border-radius:6px;cursor:pointer;font-weight:700;">从页面拉取子账号</button>
+          <span id="jxj-roster-meta" style="font-size:12px;color:#64748b;margin-left:auto;"></span>
+        </div>
+        <div id="jxj-roster-rows">${accountRosterRowsHtml()}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;">
+          <span style="font-size:12px;color:#64748b;">批量：</span>
+          <select id="jxj-roster-bulk-group" style="height:32px;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;">
+            <option value="">移入分组…</option>
+            ${getAccountGroups().map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join('')}
+          </select>
+          <button type="button" data-action="bulk-move-group" style="padding:7px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">应用</button>
+          <button type="button" data-action="bulk-make-rules" style="padding:7px 10px;border:1px solid #2563eb;background:#fff;color:#2563eb;border-radius:6px;cursor:pointer;">为选中账号生成充值规则</button>
+          <button type="button" data-action="bulk-remove-accounts" style="padding:7px 10px;border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:6px;cursor:pointer;">从名单移除</button>
+          <button type="button" data-action="save-roster" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存名单</button>
+        </div>
+      </div>
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
+        <div style="font-weight:800;margin-bottom:6px;">分组管理</div>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:8px;">分组只是给子账号打标签，用来做第 4 步的额度分配。一个子账号同时只属于一个分组。</div>
+        <div id="jxj-group-rows">${accountGroupRowsHtml()}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;">
+          <input id="jxj-new-group-name" type="text" placeholder="新分组名称，例如 搜索类" style="width:220px;height:32px;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;">
+          <button type="button" data-action="add-group" style="padding:7px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">新增分组</button>
+        </div>
+        ${nextStepButtonHtml('accounts')}
+      </div>
+    `;
+  }
+
+  function accountRosterRowsHtml() {
+    const roster = getAccountRoster();
+    const groups = getAccountGroups();
+
+    if (!roster.length) {
+      return '<div style="padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;color:#64748b;line-height:1.6;">名单还是空的。请先在京小洁投放明细页搜索并展开店铺子账号，再点「从页面拉取子账号」。开启自动查询后，每轮也会自动同步名单。</div>';
+    }
+
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr>
+            <th style="${logThStyle()}width:32px;"><input id="jxj-roster-check-all" type="checkbox"></th>
+            <th style="${logThStyle()}">子账号</th>
+            <th style="${logThStyle()}text-align:right;width:84px;">余额</th>
+            <th style="${logThStyle()}text-align:right;width:92px;">今日花费</th>
+            <th style="${logThStyle()}text-align:right;width:70px;">投产</th>
+            <th style="${logThStyle()}width:150px;">所属分组</th>
+            <th style="${logThStyle()}width:130px;">最后更新</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${roster.map((item, index) => `
+            <tr class="jxj-roster-row" data-account="${escapeHtml(item.accountName)}">
+              <td style="${logTdStyle()}"><input type="checkbox" class="jxj-roster-check" data-index="${index}"></td>
+              <td style="${logTdStyle()}">${escapeHtml(item.accountName)}</td>
+              <td style="${logTdStyle()}text-align:right;">${escapeHtml(formatMoney(item.balance))}</td>
+              <td style="${logTdStyle()}text-align:right;">${escapeHtml(formatMoney(item.spend))}</td>
+              <td style="${logTdStyle()}text-align:right;">${escapeHtml(formatRatio(item.roi))}</td>
+              <td style="${logTdStyle()}">
+                <select data-roster-field="groupId" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                  ${groups.map(group => `<option value="${escapeHtml(group.id)}" ${group.id === item.groupId ? 'selected' : ''}>${escapeHtml(group.name)}</option>`).join('')}
+                </select>
+              </td>
+              <td style="${logTdStyle()}color:#64748b;">${escapeHtml(item.updatedAt ? formatDateTime(item.updatedAt) : '—')}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function accountGroupRowsHtml() {
+    const groups = getAccountGroups();
+    const roster = getAccountRoster();
+
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr>
+            <th style="${logThStyle()}width:220px;">分组</th>
+            <th style="${logThStyle()}width:90px;">账号数</th>
+            <th style="${logThStyle()}">说明</th>
+            <th style="${logThStyle()}width:150px;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${groups.map(group => {
+            const count = roster.filter(item => item.groupId === group.id).length;
+            const fixed = group.id === UNGROUPED_ID;
+            return `
+              <tr>
+                <td style="${logTdStyle()}font-weight:700;">${escapeHtml(group.name)}</td>
+                <td style="${logTdStyle()}">${escapeHtml(count)} 个</td>
+                <td style="${logTdStyle()}color:#64748b;">${fixed ? '没有指定分组的子账号自动归到这里' : '可重命名或删除，删除后组内账号回到未分组'}</td>
+                <td style="${logTdStyle()}">
+                  ${fixed ? '<span style="color:#94a3b8;">—</span>' : `
+                    <button type="button" data-action="rename-group" data-group="${escapeHtml(group.id)}" style="padding:5px 8px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;cursor:pointer;">重命名</button>
+                    <button type="button" data-action="delete-group" data-group="${escapeHtml(group.id)}" style="padding:5px 8px;border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:4px;cursor:pointer;">删除</button>
+                  `}
+                </td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function refreshAccountRosterPanel() {
+    const rows = document.getElementById('jxj-roster-rows');
+    if (rows) rows.innerHTML = accountRosterRowsHtml();
+
+    const groupRows = document.getElementById('jxj-group-rows');
+    if (groupRows) groupRows.innerHTML = accountGroupRowsHtml();
+
+    const meta = document.getElementById('jxj-roster-meta');
+    if (meta) {
+      const info = getAccountRosterMeta();
+      meta.innerText = info.count
+        ? `名单共 ${info.count} 个子账号${info.time ? `，${formatDateTime(info.time)} 更新` : ''}`
+        : '尚未拉取子账号';
+    }
+
+    const bulkSelect = document.getElementById('jxj-roster-bulk-group');
+    if (bulkSelect) {
+      const current = bulkSelect.value;
+      bulkSelect.innerHTML = '<option value="">移入分组…</option>' +
+        getAccountGroups().map(group => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}</option>`).join('');
+      bulkSelect.value = current;
+    }
+  }
+
+  function readRosterFromPanel() {
+    const roster = getAccountRoster();
+    const rows = [...document.querySelectorAll('.jxj-roster-row')];
+    if (!rows.length) return roster;
+
+    const byName = new Map(roster.map(item => [normalizeText(item.accountName), item]));
+
+    rows.forEach(row => {
+      const item = byName.get(normalizeText(row.getAttribute('data-account')));
+      if (!item) return;
+      const select = row.querySelector('[data-roster-field="groupId"]');
+      if (select) item.groupId = select.value;
+    });
+
+    return roster;
+  }
+
+  function getSelectedRosterAccounts() {
+    return [...document.querySelectorAll('.jxj-roster-check:checked')]
+      .map(box => box.closest('.jxj-roster-row'))
+      .filter(Boolean)
+      .map(row => row.getAttribute('data-account'))
+      .filter(Boolean);
+  }
+
+  // =========================
+  // ④ 分组与账号额度
+  // =========================
+  function allocationPageHtml() {
+    return `
+      ${workspaceStepBarHtml('alloc')}
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
+        第 4 步：在店铺预算和分时上限之内，从大到小往下分配。分组和单账号都可以设额度，也可以只设条件。
+      </div>
+      <div id="jxj-alloc-chain">${allocationChainHtml()}</div>
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+          <span style="padding:2px 8px;border-radius:999px;background:#dbeafe;color:#1e40af;font-size:11px;font-weight:700;">第 3 级</span>
+          <div style="font-weight:800;">分组额度与条件</div>
+          <span style="font-size:12px;color:#64748b;margin-left:auto;">优先于全店规则</span>
+        </div>
+        <div id="jxj-group-quota-rows">${groupQuotaRowsHtml()}</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">
+          <span id="jxj-group-quota-sum" style="font-size:12px;line-height:1.6;"></span>
+          <button type="button" data-action="save-allocation" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存额度设置</button>
+        </div>
+      </div>
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+          <span style="padding:2px 8px;border-radius:999px;background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;">第 4 级</span>
+          <div style="font-weight:800;">单个账号额度与条件</div>
+          <span style="font-size:12px;color:#64748b;margin-left:auto;">优先级最高，只影响这一个账号</span>
+        </div>
+        <div id="jxj-account-quota-rows">${accountQuotaRowsHtml()}</div>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-top:8px;">
+          留空就跟随所在分组；分组也没设就跟随全店规则。额度从大到小卡：店铺当天预算 → 当前分时上限 → 分组额度 → 账号当天上限，取最小。
+        </div>
+        ${nextStepButtonHtml('alloc')}
+      </div>
+    `;
+  }
+
+  function allocationChainHtml() {
+    const settings = getBudgetSettings();
+    const decision = evaluateDailyBudget({ includePending: true, settings });
+
+    const node = (level, name, value, sub) => `
+      <div style="flex:1;min-width:170px;border:1px solid #e2e8f0;border-radius:10px;padding:10px;background:#fff;">
+        <div style="font-size:11px;color:#94a3b8;font-weight:700;">${escapeHtml(level)}</div>
+        <div style="font-weight:800;margin-top:2px;">${escapeHtml(name)}</div>
+        <div style="font-size:18px;font-weight:800;color:#1d4ed8;margin-top:6px;">${escapeHtml(value)}</div>
+        <div style="font-size:11px;color:#64748b;margin-top:4px;line-height:1.5;">${escapeHtml(sub)}</div>
+      </div>
+    `;
+
+    return `
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
+        <div style="font-weight:800;margin-bottom:8px;">当前可分配额度</div>
+        <div style="display:flex;align-items:stretch;gap:8px;flex-wrap:wrap;">
+          ${node('第 1 级 · 店铺', '当天总预算', `${formatMoney(decision.budget)} 元`, '近七天平均业绩 × 推广费比')}
+          <div style="align-self:center;color:#94a3b8;font-weight:800;">›</div>
+          ${node('第 2 级 · 分时', `当前时段 ${formatSlotRange(decision.slot)}`, `${formatMoney(decision.slotBudget)} 元`, `已用 ${formatMoney(decision.counted)} 元，还能分配 ${formatMoney(decision.remaining)} 元`)}
+        </div>
+      </div>
+    `;
+  }
+
+  function groupQuotaRowsHtml() {
+    const settings = getBudgetSettings();
+    const slot = getCurrentBudgetSlot(settings);
+    const groups = getAccountGroups();
+    const roster = getAccountRoster();
+
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr>
+            <th style="${logThStyle()}width:140px;">分组</th>
+            <th style="${logThStyle()}width:70px;">账号数</th>
+            <th style="${logThStyle()}width:150px;">额度方式</th>
+            <th style="${logThStyle()}width:90px;">数值</th>
+            <th style="${logThStyle()}width:110px;">当天额度</th>
+            <th style="${logThStyle()}width:90px;">一次充值</th>
+            <th style="${logThStyle()}width:90px;">投产高于</th>
+            <th style="${logThStyle()}">当前时段还能充</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${groups.map(group => {
+            const count = roster.filter(item => item.groupId === group.id).length;
+            const daily = getGroupDailyQuota(group, settings);
+            const slotQuota = getGroupSlotQuota(group, settings, slot);
+            const used = slotQuota === null ? 0 : getGroupUsedAmount(group.id, { includePending: true });
+            const left = slotQuota === null ? null : Math.max(0, slotQuota - used);
+
+            return `
+              <tr class="jxj-group-quota-row" data-group="${escapeHtml(group.id)}">
+                <td style="${logTdStyle()}font-weight:700;">${escapeHtml(group.name)}</td>
+                <td style="${logTdStyle()}">${escapeHtml(count)} 个</td>
+                <td style="${logTdStyle()}">
+                  <select data-group-field="quotaMode" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                    <option value="percent" ${group.quotaMode === 'percent' ? 'selected' : ''}>按店铺预算百分比</option>
+                    <option value="fixed" ${group.quotaMode === 'fixed' ? 'selected' : ''}>固定金额</option>
+                    <option value="none" ${group.quotaMode === 'none' ? 'selected' : ''}>不限制</option>
+                  </select>
+                </td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="1" data-group-field="quotaValue" value="${escapeHtml(group.quotaValue)}" ${group.quotaMode === 'none' ? 'disabled' : ''} style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}" class="jxj-group-quota-amount">${daily === null ? '<span style="color:#94a3b8;">不限</span>' : `${escapeHtml(formatMoney(daily))} 元`}</td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="1" data-group-field="amount" value="${group.amount === null ? '' : escapeHtml(group.amount)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="0.1" data-group-field="minRoi" value="${group.minRoi === null ? '' : escapeHtml(group.minRoi)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}color:#64748b;" class="jxj-group-quota-left">
+                  ${left === null
+                    ? '只受上一级约束'
+                    : `时段上限 ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(left))}</b> 元`}
+                </td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function accountQuotaRowsHtml() {
+    const roster = getAccountRoster();
+
+    if (!roster.length) {
+      return '<div style="padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;color:#64748b;">先在第 3 步「子账号与分组」拉取子账号，这里才能逐个设置。</div>';
+    }
+
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr>
+            <th style="${logThStyle()}">子账号</th>
+            <th style="${logThStyle()}width:130px;">所属分组</th>
+            <th style="${logThStyle()}width:110px;">当天上限</th>
+            <th style="${logThStyle()}width:100px;">一次充值</th>
+            <th style="${logThStyle()}width:100px;">投产高于</th>
+            <th style="${logThStyle()}">说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${roster.map(item => {
+            const group = getAccountGroup(item.groupId);
+            const custom = item.dailyCap !== null || item.amount !== null || item.minRoi !== null;
+            return `
+              <tr class="jxj-account-quota-row" data-account="${escapeHtml(item.accountName)}">
+                <td style="${logTdStyle()}">${escapeHtml(item.accountName)}</td>
+                <td style="${logTdStyle()}">${escapeHtml(group.name)}</td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="1" data-account-field="dailyCap" value="${item.dailyCap === null ? '' : escapeHtml(item.dailyCap)}" placeholder="不限" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="1" data-account-field="amount" value="${item.amount === null ? '' : escapeHtml(item.amount)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}">
+                  <input type="number" min="0" step="0.1" data-account-field="minRoi" value="${item.minRoi === null ? '' : escapeHtml(item.minRoi)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                </td>
+                <td style="${logTdStyle()}color:#64748b;">${custom ? '已单独设置，优先于分组' : `跟随「${escapeHtml(group.name)}」`}</td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function refreshAllocationPanel(options) {
+    const rerender = !!(options && options.rerender);
+
+    const chain = document.getElementById('jxj-alloc-chain');
+    if (chain) chain.innerHTML = allocationChainHtml();
+
+    if (rerender) {
+      const groupRows = document.getElementById('jxj-group-quota-rows');
+      if (groupRows) groupRows.innerHTML = groupQuotaRowsHtml();
+
+      const accountRows = document.getElementById('jxj-account-quota-rows');
+      if (accountRows) accountRows.innerHTML = accountQuotaRowsHtml();
+    } else {
+      // 输入过程中只更新换算金额，不重建输入框。
+      const settings = getBudgetSettings();
+      const slot = getCurrentBudgetSlot(settings);
+      [...document.querySelectorAll('.jxj-group-quota-row')].forEach(row => {
+        const group = readGroupRowFromPanel(row);
+        if (!group) return;
+        const daily = getGroupDailyQuota(group, settings);
+        const slotQuota = getGroupSlotQuota(group, settings, slot);
+        const used = slotQuota === null ? 0 : getGroupUsedAmount(group.id, { includePending: true });
+        const amountCell = row.querySelector('.jxj-group-quota-amount');
+        const leftCell = row.querySelector('.jxj-group-quota-left');
+        if (amountCell) amountCell.innerHTML = daily === null ? '<span style="color:#94a3b8;">不限</span>' : `${escapeHtml(formatMoney(daily))} 元`;
+        if (leftCell) {
+          leftCell.innerHTML = slotQuota === null
+            ? '只受上一级约束'
+            : `时段上限 ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(Math.max(0, slotQuota - used)))}</b> 元`;
+        }
+      });
+    }
+
+    refreshGroupQuotaSum();
+  }
+
+  function refreshGroupQuotaSum() {
+    const box = document.getElementById('jxj-group-quota-sum');
+    if (!box) return;
+
+    const settings = getBudgetSettings();
+    const budget = getDailyBudgetAmount(settings);
+    const groups = readGroupsFromPanel();
+    const total = groups.reduce((sum, group) => sum + (getGroupDailyQuota(group, settings) || 0), 0);
+
+    if (!(budget > 0)) {
+      box.innerHTML = '<span style="color:#64748b;">还没设置店铺当天预算，百分比暂时算不出金额。可以先填固定金额，或回第 1 步设置预算。</span>';
+      return;
+    }
+
+    box.innerHTML = total > budget
+      ? `<span style="color:#b45309;">各分组额度合计 ${escapeHtml(formatMoney(total))} 元，超过店铺当天预算 ${escapeHtml(formatMoney(budget))} 元。仍可保存，实际以上一级为硬上限，先到先用。</span>`
+      : `<span style="color:#15803d;">各分组额度合计 ${escapeHtml(formatMoney(total))} 元，未超过店铺当天预算 ${escapeHtml(formatMoney(budget))} 元。</span>`;
+  }
+
+  function readGroupRowFromPanel(row) {
+    if (!row) return null;
+    const groupId = row.getAttribute('data-group');
+    const saved = getAccountGroups().find(group => group.id === groupId);
+    if (!saved) return null;
+
+    const readValue = field => {
+      const el = row.querySelector(`[data-group-field="${field}"]`);
+      return el ? el.value : '';
+    };
+
+    return normalizeAccountGroup({
+      id: groupId,
+      name: saved.name,
+      quotaMode: readValue('quotaMode') || saved.quotaMode,
+      quotaValue: readValue('quotaValue'),
+      amount: readValue('amount'),
+      minRoi: readValue('minRoi')
+    });
+  }
+
+  function readGroupsFromPanel() {
+    const rows = [...document.querySelectorAll('.jxj-group-quota-row')];
+    if (!rows.length) return getAccountGroups();
+    return rows.map(readGroupRowFromPanel).filter(Boolean);
+  }
+
+  function readAccountQuotaFromPanel() {
+    const roster = getAccountRoster();
+    const rows = [...document.querySelectorAll('.jxj-account-quota-row')];
+    if (!rows.length) return roster;
+
+    const byName = new Map(roster.map(item => [normalizeText(item.accountName), item]));
+
+    rows.forEach(row => {
+      const item = byName.get(normalizeText(row.getAttribute('data-account')));
+      if (!item) return;
+      const readValue = field => {
+        const el = row.querySelector(`[data-account-field="${field}"]`);
+        return el ? el.value : '';
+      };
+      item.dailyCap = readValue('dailyCap') === '' ? null : Math.max(0, Number(readValue('dailyCap')));
+      item.amount = readValue('amount') === '' ? null : Math.max(0, Number(readValue('amount')));
+      item.minRoi = readValue('minRoi') === '' ? null : Math.max(0, Number(readValue('minRoi')));
+    });
+
+    return roster;
+  }
+
   function budgetSlotPageHtml() {
     const settings = getBudgetSettings();
 
     return `
+      ${workspaceStepBarHtml('slots')}
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
+        第 2 步：把全店预算按时段切开。这是累计上限，到某个时段为止最多花多少，不是各段相加。
+      </div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
         <div style="font-weight:800;margin-bottom:6px;">分时累计上限</div>
         <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:10px;">
@@ -2461,6 +3324,7 @@
           <button type="button" data-action="save-slots" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存分时规则</button>
         </div>
         <div id="jxj-slot-hint" style="font-size:12px;line-height:1.6;margin-top:10px;">${budgetSlotHintHtml()}</div>
+        ${nextStepButtonHtml('slots')}
       </div>
     `;
   }
@@ -3701,16 +4565,55 @@
     }, 15 * 1000); // 固定时间充值检查频率：每15秒检查一次是否到点。
   }
 
+  // 从大到小逐级设置：店铺预算 → 分时预算 → 子账号与分组 → 分组和账号额度 → 充值规则。
   const WORKSPACE_PAGES = [
     { id: 'overview', label: '总览' },
-    { id: 'budget', label: '店铺预算' },
-    { id: 'slots', label: '店铺分时规则' },
-    { id: 'rules', label: '充值规则' },
+    { id: 'budget', label: '① 店铺预算', step: 1 },
+    { id: 'slots', label: '② 分时预算', step: 2 },
+    { id: 'accounts', label: '③ 子账号与分组', step: 3 },
+    { id: 'alloc', label: '④ 分组与账号额度', step: 4 },
+    { id: 'rules', label: '⑤ 充值规则', step: 5 },
     { id: 'queue', label: '充值队列' },
     { id: 'logs', label: '提交记录' },
     { id: 'settings', label: '运行设置' },
     { id: 'versions', label: '版本中心' }
   ];
+
+  const WORKSPACE_STEPS = WORKSPACE_PAGES.filter(page => page.step);
+
+  function workspaceStepBarHtml(activeId) {
+    const active = WORKSPACE_STEPS.find(page => page.id === activeId);
+    if (!active) return '';
+
+    return `
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+        ${WORKSPACE_STEPS.map((page, index) => {
+          const on = page.id === activeId;
+          const dot = `<span style="width:16px;height:16px;border-radius:50%;background:${on ? '#2563eb' : '#cbd5e1'};color:#fff;font-size:10px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;">${page.step}</span>`;
+          const label = page.label.replace(/^[①②③④⑤]\s*/, '');
+          return `
+            <button type="button" data-workspace-nav="${page.id}" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:0;border-radius:999px;background:${on ? '#dbeafe' : '#f1f5f9'};color:${on ? '#1e40af' : '#64748b'};font-size:12px;font-weight:${on ? 700 : 500};cursor:pointer;">${dot}${escapeHtml(label)}</button>
+            ${index < WORKSPACE_STEPS.length - 1 ? '<span style="color:#cbd5e1;font-size:12px;">›</span>' : ''}
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+
+  function nextStepButtonHtml(currentId) {
+    const index = WORKSPACE_STEPS.findIndex(page => page.id === currentId);
+    if (index < 0) return '';
+
+    const previous = WORKSPACE_STEPS[index - 1];
+    const next = WORKSPACE_STEPS[index + 1];
+
+    return `
+      <div style="display:flex;justify-content:space-between;gap:8px;margin-top:12px;flex-wrap:wrap;">
+        <div>${previous ? `<button type="button" data-workspace-nav="${previous.id}" style="padding:7px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">上一步 · ${escapeHtml(previous.label.replace(/^[①②③④⑤]\s*/, ''))}</button>` : ''}</div>
+        <div>${next ? `<button type="button" data-workspace-nav="${next.id}" style="padding:7px 12px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">下一步 · ${escapeHtml(next.label.replace(/^[①②③④⑤]\s*/, ''))}</button>` : ''}</div>
+      </div>
+    `;
+  }
 
   function getLatestVersionEntry() {
     return VERSION_HISTORY[0] || { version: SCRIPT_VERSION, date: '', type: 'feature', title: '当前版本', items: [] };
@@ -3892,6 +4795,50 @@
     `;
   }
 
+  function overviewGroupTableHtml(decision) {
+    const settings = decision.settings;
+    const slot = decision.slot;
+    const groups = getAccountGroups();
+    const roster = getAccountRoster();
+
+    if (!roster.length) {
+      return '<div style="font-size:12px;color:#64748b;line-height:1.6;">还没有子账号名单。到「③ 子账号与分组」点「从页面拉取子账号」，就能按分组分配额度。</div>';
+    }
+
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:12px;">
+        <thead>
+          <tr style="background:#f8fafc;color:#475569;">
+            <th style="text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;">分组</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">账号数</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">当天额度</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">已用</th>
+            <th style="text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;">当前时段还能充</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${groups.map(group => {
+            const count = roster.filter(item => item.groupId === group.id).length;
+            const daily = getGroupDailyQuota(group, settings);
+            const slotQuota = getGroupSlotQuota(group, settings, slot);
+            const used = getGroupUsedAmount(group.id, { includePending: true });
+            const left = slotQuota === null ? null : Math.max(0, slotQuota - used);
+
+            return `
+              <tr>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;font-weight:700;color:#0f172a;">${escapeHtml(group.name)}</td>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${escapeHtml(count)}</td>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${daily === null ? '不限' : `${escapeHtml(formatMoney(daily))} 元`}</td>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${escapeHtml(formatMoney(used))} 元</td>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;color:#334155;">${left === null ? '只受店铺和分时约束' : `${escapeHtml(formatMoney(left))} 元`}</td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
+  }
+
   function overviewDashboardHtml() {
     try {
       return buildOverviewDashboardHtml();
@@ -3931,6 +4878,10 @@
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:12px;">
         <div style="font-weight:800;color:#0f172a;margin-bottom:8px;">时段对照</div>
         ${overviewSlotTableHtml(decision)}
+      </div>
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:12px;">
+        <div style="font-weight:800;color:#0f172a;margin-bottom:8px;">分组额度进度</div>
+        ${overviewGroupTableHtml(decision)}
       </div>
       <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:10px 12px;font-size:13px;color:#1e3a8a;line-height:1.5;">
         ${currentRule.useTimeSlots && currentRuleSlot
@@ -3989,6 +4940,8 @@
     if (pageId === 'overview') refreshOverviewDashboard();
     if (pageId === 'budget') refreshBudgetPanel({ fillInputs: true });
     if (pageId === 'slots') refreshBudgetSlotPage({ rerender: true });
+    if (pageId === 'accounts') refreshAccountRosterPanel();
+    if (pageId === 'alloc') refreshAllocationPanel({ rerender: true });
     if (pageId === 'queue') {
       refreshQueuePanel();
       refreshSimulationPanel();
@@ -4045,6 +4998,180 @@
     if (action === 'goto-logs') return switchWorkspacePage('logs');
     if (action === 'goto-budget') return switchWorkspacePage('budget');
     if (action === 'goto-slots') return switchWorkspacePage('slots');
+    if (action === 'goto-accounts') return switchWorkspacePage('accounts');
+    if (action === 'goto-alloc') return switchWorkspacePage('alloc');
+
+    if (action === 'pull-accounts') {
+      if (!isJxjAdPage()) {
+        window.alert('请在京小洁「广告投放明细」页面拉取子账号。\n当前地址：' + location.href);
+        return;
+      }
+
+      const accounts = collectExpandedAccounts();
+      if (!accounts.length) {
+        window.alert('当前页面没有读取到已展开的子账号。请先搜索店铺并展开子账号，或先点「立即执行全流程」跑一轮，再来拉取。');
+        return;
+      }
+
+      const result = mergeAccountsIntoRoster(accounts);
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus(`已拉取子账号：新增 ${result.added} 个，更新 ${result.updated} 个，名单共 ${getAccountRosterMeta().count} 个。`);
+      return;
+    }
+
+    if (action === 'save-roster') {
+      saveAccountRoster(readRosterFromPanel(), { keepTime: true });
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus('已保存子账号名单和分组归属');
+      return;
+    }
+
+    if (action === 'bulk-move-group') {
+      const select = panel.querySelector('#jxj-roster-bulk-group');
+      const groupId = select ? select.value : '';
+      const names = getSelectedRosterAccounts();
+
+      if (!groupId) {
+        window.alert('请先在下拉框里选择要移入的分组。');
+        return;
+      }
+      if (!names.length) {
+        window.alert('请先勾选要移动的子账号。');
+        return;
+      }
+
+      const keys = new Set(names.map(normalizeText));
+      const roster = readRosterFromPanel().map(item =>
+        keys.has(normalizeText(item.accountName)) ? Object.assign({}, item, { groupId }) : item
+      );
+
+      saveAccountRoster(roster, { keepTime: true });
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus(`已把 ${names.length} 个子账号移入「${getAccountGroup(groupId).name}」`);
+      return;
+    }
+
+    if (action === 'bulk-remove-accounts') {
+      const names = getSelectedRosterAccounts();
+      if (!names.length) {
+        window.alert('请先勾选要移除的子账号。');
+        return;
+      }
+      if (!window.confirm(`确定从名单移除 ${names.length} 个子账号吗？下次拉取还会重新出现。`)) return;
+
+      const keys = new Set(names.map(normalizeText));
+      saveAccountRoster(readRosterFromPanel().filter(item => !keys.has(normalizeText(item.accountName))), { keepTime: true });
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus(`已从名单移除 ${names.length} 个子账号`);
+      return;
+    }
+
+    if (action === 'bulk-make-rules') {
+      const names = getSelectedRosterAccounts();
+      if (!names.length) {
+        window.alert('请先勾选要生成充值规则的子账号。');
+        return;
+      }
+
+      const rules = getRules();
+      const exists = new Set(rules.filter(rule => rule.matchType === 'exact').map(rule => normalizeText(rule.accountPattern)));
+      let added = 0;
+
+      names.forEach(name => {
+        if (exists.has(normalizeText(name))) return;
+        rules.push(makeExactAccountRule(name));
+        exists.add(normalizeText(name));
+        added += 1;
+      });
+
+      saveRules(rules);
+      refreshRulePanelRows(panel, getRules());
+      refreshRuleConflictPanel(getRules());
+      showStatus(`已生成 ${added} 条分账号充值规则，可到「⑤ 充值规则」页继续调整。`);
+      return;
+    }
+
+    if (action === 'add-group') {
+      const input = panel.querySelector('#jxj-new-group-name');
+      const name = input ? String(input.value || '').trim() : '';
+
+      if (!name) {
+        window.alert('请先填写分组名称。');
+        return;
+      }
+
+      const groups = getAccountGroups();
+      if (groups.some(group => group.name === name)) {
+        window.alert('已经有同名分组了，请换一个名称。');
+        return;
+      }
+
+      groups.push(normalizeAccountGroup({ id: makeLogId(), name, quotaMode: 'none', quotaValue: 0 }));
+      saveAccountGroups(groups);
+      if (input) input.value = '';
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus(`已新增分组「${name}」。到第 4 步可以给它设额度。`);
+      return;
+    }
+
+    if (action === 'rename-group') {
+      const groupId = actionEl && actionEl.getAttribute('data-group');
+      const group = getAccountGroup(groupId);
+      if (!group || group.id === UNGROUPED_ID) return;
+
+      const name = window.prompt('新的分组名称', group.name);
+      if (!name || !String(name).trim()) return;
+
+      saveAccountGroups(getAccountGroups().map(item =>
+        item.id === groupId ? Object.assign({}, item, { name: String(name).trim() }) : item
+      ));
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus('已重命名分组');
+      return;
+    }
+
+    if (action === 'delete-group') {
+      const groupId = actionEl && actionEl.getAttribute('data-group');
+      const group = getAccountGroup(groupId);
+      if (!group || group.id === UNGROUPED_ID) return;
+
+      const count = getGroupAccountNames(groupId).length;
+      if (!window.confirm(`确定删除分组「${group.name}」吗？组内 ${count} 个子账号会回到「未分组」。`)) return;
+
+      saveAccountGroups(getAccountGroups().filter(item => item.id !== groupId));
+      saveAccountRoster(getAccountRoster().map(item =>
+        item.groupId === groupId ? Object.assign({}, item, { groupId: UNGROUPED_ID }) : item
+      ), { keepTime: true });
+      refreshAccountRosterPanel();
+      refreshAllocationPanel({ rerender: true });
+      showStatus(`已删除分组「${group.name}」，${count} 个子账号回到未分组`);
+      return;
+    }
+
+    if (action === 'save-allocation') {
+      const groups = readGroupsFromPanel();
+      const roster = readAccountQuotaFromPanel();
+      const settings = getBudgetSettings();
+      const budget = getDailyBudgetAmount(settings);
+      const total = groups.reduce((sum, group) => sum + (getGroupDailyQuota(group, settings) || 0), 0);
+
+      saveAccountGroups(groups);
+      saveAccountRoster(roster, { keepTime: true });
+      refreshAllocationPanel({ rerender: true });
+      refreshOverviewDashboard();
+
+      const overText = budget > 0 && total > budget
+        ? `\n提醒：各分组额度合计 ${formatMoney(total)} 元，超过店铺当天预算 ${formatMoney(budget)} 元。已保存，实际以上一级为硬上限、先到先用。`
+        : '';
+      showStatus(`已保存分组额度和账号额度设置。${overText}`);
+      return;
+    }
     if (action === 'goto-queue') return switchWorkspacePage('queue');
     if (action === 'goto-versions') return switchWorkspacePage('versions');
 
@@ -4245,7 +5372,7 @@
       'position: fixed',
       'right: 16px',
       'bottom: 58px',
-      'width: 1080px',
+      'width: 1180px',
       'max-width: calc(100vw - 32px)',
       'height: 82vh',
       'overflow: hidden',
@@ -4262,7 +5389,7 @@
     try {
     panel.innerHTML = `
       <div style="display:flex;height:82vh;">
-        <div style="width:168px;flex:0 0 168px;background:#1e293b;color:#fff;padding:14px 10px;display:flex;flex-direction:column;">
+        <div style="width:186px;flex:0 0 186px;background:#1e293b;color:#fff;padding:14px 10px;display:flex;flex-direction:column;">
           <div style="font-weight:800;font-size:14px;padding:4px 8px 12px;">充值工作台</div>
           <div id="jxj-workspace-nav">${workspaceNavHtml()}</div>
           <div style="margin-top:auto;padding:8px;">
@@ -4284,13 +5411,19 @@
               <div id="jxj-overview-dashboard">${overviewDashboardHtml()}</div>
               <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
                 <button type="button" data-action="manual-full-flow" style="padding:8px 12px;border:0;background:#16a34a;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">立即执行</button>
+                <button type="button" data-action="goto-budget" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">从第 1 步开始设置</button>
+                <button type="button" data-action="goto-accounts" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">子账号与分组</button>
+                <button type="button" data-action="goto-alloc" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">分组与账号额度</button>
                 <button type="button" data-action="goto-rules" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">去改规则</button>
                 <button type="button" data-action="goto-logs" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">查看记录</button>
-                <button type="button" data-action="goto-budget" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">去改预算</button>
                 <button type="button" data-action="goto-versions" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">版本中心</button>
               </div>
             </div>
             <div data-workspace-page="budget" style="display:none;">
+              ${workspaceStepBarHtml('budget')}
+              <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
+                第 1 步：先定全店当天能花多少。这是最高一级上限，后面的分时、分组、账号都不能超过它。
+              </div>
               <div style="border:1px solid #e2e8f0;border-radius:12px;background:#fff;padding:14px;">
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
                   <div>
@@ -4318,12 +5451,23 @@
                   <div id="jxj-budget-summary" style="font-size:12px;line-height:1.55;color:#334155;flex:1;"></div>
                   <button type="button" data-action="save-budget" style="padding:7px 12px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;">保存预算</button>
                 </div>
+                ${nextStepButtonHtml('budget')}
               </div>
             </div>
             <div data-workspace-page="slots" style="display:none;">
               ${budgetSlotPageHtml()}
             </div>
+            <div data-workspace-page="accounts" style="display:none;">
+              <div id="jxj-accounts-page">${accountRosterPageHtml()}</div>
+            </div>
+            <div data-workspace-page="alloc" style="display:none;">
+              <div id="jxj-alloc-page">${allocationPageHtml()}</div>
+            </div>
             <div data-workspace-page="rules" style="display:none;">
+              ${workspaceStepBarHtml('rules')}
+              <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
+                第 5 步：设置什么时候充、充多少。条件从小到大找：账号单独设置 &gt; 所在分组 &gt; 这里的全店规则。分组和账号的设置在第 4 步。
+              </div>
               ${ruleScopeGuideHtml()}
               ${bulkRuleControlHtml()}
               <div id="jxj-rule-conflicts" style="margin-bottom:8px;"></div>
@@ -4536,7 +5680,16 @@
       input.addEventListener('change', () => refreshBudgetPreview(panel));
     });
 
+    panel.addEventListener('change', event => {
+      if (event.target.id !== 'jxj-roster-check-all') return;
+      panel.querySelectorAll('.jxj-roster-check').forEach(box => { box.checked = event.target.checked; });
+    });
+
     panel.addEventListener('input', event => {
+      if (event.target.closest('.jxj-group-quota-row')) {
+        refreshAllocationPanel();
+        return;
+      }
       if (event.target.closest('.jxj-slot-row')) {
         refreshBudgetSlotPage();
         return;
@@ -4978,6 +6131,12 @@
     updateShopMetricsSnapshot(accounts);
 
     const list = accounts || [];
+
+    if (CONFIG.autoSyncAccountRoster && list.length) {
+      mergeAccountsIntoRoster(list); // 名单跟着每轮查询更新，余额和投产保持最新。
+      refreshAccountRosterPanel();
+    }
+
     const decisions = list.map(account => ({ account, result: decideAccountRecharge(account) }));
     const matched = decisions.filter(item => item.result.task).map(item => item.result.task);
     const skipRows = decisions
@@ -4993,9 +6152,24 @@
 
     budgeted.skipped.forEach(item => {
       const reason = String(item.skipReason || '');
+      const levelKey = item.skipLevel === 'group'
+        ? SKIP_GROUP_QUOTA
+        : item.skipLevel === 'account'
+          ? SKIP_ACCOUNT_CAP
+          : reason.indexOf('当日') >= 0
+            ? SKIP_DAILY_BUDGET
+            : SKIP_SLOT_BUDGET;
+      const levelText = item.skipLevel === 'group'
+        ? '被第 3 级分组额度挡住'
+        : item.skipLevel === 'account'
+          ? '被第 4 级账号当天上限挡住'
+          : reason.indexOf('当日') >= 0
+            ? '被第 1 级店铺当天预算挡住'
+            : '被第 2 级分时上限挡住';
+
       skipRows.push(makeSkipRow(item, {
-        key: reason.indexOf('当日') >= 0 ? SKIP_DAILY_BUDGET : SKIP_SLOT_BUDGET,
-        detail: `${reason}，本次需 ${formatMoney(item.amount)} 元`
+        key: levelKey,
+        detail: `${levelText}：${reason}，本次需 ${formatMoney(item.amount)} 元`
       }));
     });
 
