@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.5.5
+// @version      5.6.0
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -46,6 +46,11 @@
     submitDedupMs: 2 * 60 * 1000, // 提交充值防重复：同账号2分钟内不重复点击“转入”提交。
     maxTaskRetryCount: 3, // 失败任务最多重试次数：单个账号处理失败后最多重新排队3次，超过后记录失败并跳过。
     failedTaskCooldownMs: 30 * 60 * 1000, // 失败冷却时间：超过重试上限的账号30分钟内不再重新加入队列，避免每轮查询都反复失败。
+    rechargeLogLimit: 200, // 充值动作日志保留条数：只记已提交、失败、预算未提交、跨天重置这类真实动作。
+    skipChangeLogLimit: 200, // 未充值原因变化日志保留条数：同一账号原因不变时只累加轮数，不新增记录。
+    scanSnapshotVisibleRows: 6, // 本轮未充值原因默认显示行数，其余点“展开全部”再看。
+    staleSpendGuardUntilHour: 3, // 跨天保护：凌晨这个点之前，如果页面花费和昨天总花费几乎一样，判为页面还没切到新一天，不采用。
+    staleSpendRatio: 0.95, // 跨天保护判定比例：花费达到昨天总花费的该比例即视为过期读数。
     dingTalkEnabled: true, // 默认开启钉钉通知；实际是否发送还要看工作台里是否填写了机器人地址。
     dingTalkWebhook: '', // 钉钉机器人地址请在工作台「运行设置」填写，不要写在代码里。
     dingTalkSecret: '', // 钉钉加签密钥请在工作台填写；没开加签就留空。
@@ -88,9 +93,14 @@
   const STORAGE_SHOP_DAILY_GMV = 'jxj_yanyuan_recharge_shop_daily_gmv_auto_v23';
   const STORAGE_LAST_SEEN_VERSION = 'jxj_yanyuan_recharge_last_seen_version_auto_v23';
   const STORAGE_BUDGET_USED_SEED = 'jxj_yanyuan_recharge_budget_used_seed_auto_v23';
+  const STORAGE_ACTIVE_DATE = 'jxj_yanyuan_recharge_active_date_auto_v23';
+  const STORAGE_SCAN_SNAPSHOT = 'jxj_yanyuan_recharge_scan_snapshot_auto_v23';
+  const STORAGE_SKIP_REASON_STATS = 'jxj_yanyuan_recharge_skip_reason_stats_auto_v23';
+  const STORAGE_SKIP_REASON_STATE = 'jxj_yanyuan_recharge_skip_reason_state_auto_v23';
+  const STORAGE_SKIP_REASON_CHANGES = 'jxj_yanyuan_recharge_skip_reason_changes_auto_v23';
 
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.5.5';
+  const SCRIPT_VERSION = '5.6.0';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -98,6 +108,20 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.6.0',
+      date: '2026-08-20',
+      type: 'feature',
+      title: '充值日志、跨天预算和店铺分时规则',
+      items: [
+        '提交记录页新增「本轮未充值原因」「当天原因统计」「未充值原因变化」，没充值也能看到原因',
+        '日志量和扫描频率无关：本轮快照每轮覆盖，统计只累加次数，原因不变时只加轮数',
+        '修复过 0 点后当天预算没有重置、导致一整天充不了的问题，并在日志里留一条跨天重置',
+        '凌晨页面还显示昨天花费时不再当成今日已消耗',
+        '新增「店铺分时规则」页：时段和累计上限都能改，可增删时段、恢复默认',
+        '总览「时段对照」改为读取店铺分时规则，不再写死四个时段'
+      ]
+    },
     {
       version: '5.5.5',
       date: '2026-08-20',
@@ -271,6 +295,9 @@
   let activeWorkspacePage = 'overview';
   let pageMode = '';
   let urlWatchStarted = false;
+  let rechargeLogFilter = 'all';
+  let scanSnapshotExpanded = false;
+  let dailyResetTimerStarted = false;
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -287,6 +314,36 @@
     GM_deleteValue(STORAGE_TASK_FAILED_UNTIL_MAP);
     GM_deleteValue(STORAGE_ACCOUNT_SUBMIT_GUARD);
     GM_setValue(STORAGE_SCRIPT_VERSION, SCRIPT_VERSION);
+  }
+
+  // 过 0 点后必须把昨天的已用金额和花费快照清掉，否则昨天的消耗会被当成今天已用，导致一整天充不了。
+  function resetDailyStateIfNewDay() {
+    const today = todayKey();
+    const savedDate = String(GM_getValue(STORAGE_ACTIVE_DATE, ''));
+    if (savedDate === today) return false;
+
+    const seed = readJsonValue(STORAGE_BUDGET_USED_SEED, {});
+    const clearedAmount = Math.max(0, Number((seed && seed.amount) || 0));
+
+    GM_deleteValue(STORAGE_BUDGET_USED_SEED);
+    GM_deleteValue(STORAGE_SHOP_METRIC_SNAPSHOT);
+    GM_deleteValue(STORAGE_SCAN_SNAPSHOT);
+    GM_deleteValue(STORAGE_SKIP_REASON_STATS);
+    GM_deleteValue(STORAGE_SKIP_REASON_STATE);
+    GM_setValue(STORAGE_ACTIVE_DATE, today);
+
+    if (savedDate) {
+      addRechargeLog({
+        accountName: '系统',
+        amount: 0,
+        ruleName: '—',
+        triggerReason: `进入 ${today}，已清空 ${savedDate} 的已用金额 ${formatMoney(clearedAmount)} 元和花费快照，当天预算重新开始计算`
+      }, '跨天重置');
+      showStatus(`已跨天重置：清空 ${savedDate} 的已用金额 ${formatMoney(clearedAmount)} 元，${today} 预算重新开始计算`);
+    }
+
+    refreshBudgetPanel();
+    return true;
   }
 
   function pad2(value) {
@@ -643,26 +700,28 @@
     }
   }
 
+  // 返回 { added, skipRows }，skipRows 说明命中规则却没进队列的原因。
   function addTasks(targets) {
-    if (!Array.isArray(targets) || !targets.length) return 0;
-    if (isPaused()) return 0;
+    const empty = { added: 0, skipRows: [] };
+    if (!Array.isArray(targets) || !targets.length) return empty;
+    if (isPaused()) return empty;
 
     const budgeted = prepareTasksWithDailyBudget(targets);
     const pendingTargets = budgeted.tasks;
 
     if (isDryRun()) {
       setSimulationResults(pendingTargets, '模拟投递', budgeted);
-      return 0;
+      return empty;
     }
 
     if (!pendingTargets.length) {
       refreshBudgetPanel();
-      return 0;
+      return empty;
     }
 
     if (!acquireTaskQueueLock()) {
       showStatus('另一个页面正在写入充值任务队列，本次跳过重复投递');
-      return 0;
+      return empty;
     }
 
     try {
@@ -671,6 +730,7 @@
       const dedupMap = getTaskDedupMap();
       const failedUntilMap = getTaskFailedUntilMap();
       const now = Date.now();
+      const skipRows = [];
       let added = 0;
 
       pruneTaskDedupMap(dedupMap, now);
@@ -678,10 +738,32 @@
 
       for (const item of pendingTargets) {
         if (!item || !item.accountName) continue;
-        if (current && sameAccount(current.accountName, item.accountName)) continue;
-        if (queueHasAccount(queue, item.accountName)) continue;
-        if (hasRecentTaskDedup(item.accountName, dedupMap, now)) continue;
-        if (hasRecentTaskFailure(item.accountName, failedUntilMap, now)) continue;
+
+        if (current && sameAccount(current.accountName, item.accountName)) {
+          skipRows.push(makeSkipRow(item, { key: SKIP_IN_QUEUE, detail: '该账号正在充值页处理中' }));
+          continue;
+        }
+
+        if (queueHasAccount(queue, item.accountName)) {
+          skipRows.push(makeSkipRow(item, { key: SKIP_IN_QUEUE, detail: '该账号已在充值队列里等待' }));
+          continue;
+        }
+
+        if (hasRecentTaskDedup(item.accountName, dedupMap, now)) {
+          skipRows.push(makeSkipRow(item, {
+            key: SKIP_RECENT_TASK,
+            detail: `${formatRatio(CONFIG.taskDedupMs / 60000)} 分钟内已投递过，避免重复充值`
+          }));
+          continue;
+        }
+
+        if (hasRecentTaskFailure(item.accountName, failedUntilMap, now)) {
+          skipRows.push(makeSkipRow(item, {
+            key: SKIP_FAILED_COOLDOWN,
+            detail: `之前充值失败次数已达上限，${formatRatio(CONFIG.failedTaskCooldownMs / 60000)} 分钟冷却内不再排队`
+          }));
+          continue;
+        }
 
         queue.push(item);
         markTaskDedup(item.accountName, dedupMap, now);
@@ -699,7 +781,7 @@
       }
 
       refreshQueuePanel();
-      return added;
+      return { added, skipRows };
     } finally {
       releaseTaskQueueLock();
     }
@@ -1198,11 +1280,20 @@
     setRuleDoneMap(done);
   }
 
-  function buildRechargeTask(account) {
+  // 返回 { task } 或 { skip: { key, detail } }，让没充值的账号也能说清原因。
+  function decideAccountRecharge(account) {
     const rules = getAccountRules(account.accountName);
+
+    if (!rules.length) {
+      return { skip: { key: SKIP_NO_RULE, detail: '没有匹配到启用中的充值规则' } };
+    }
+
+    const candidates = [];
+    let thresholdRuleCount = 0;
 
     for (const rule of rules) {
       if (!rule.useThreshold) continue;
+      thresholdRuleCount += 1;
 
       let amount = Number(rule.amount || CONFIG.rechargeAmount);
       let minRoi = Number(rule.minRoi || CONFIG.minRoi);
@@ -1210,29 +1301,65 @@
 
       if (rule.useTimeSlots) {
         timeSlot = getCurrentRuleTimeSlot(rule);
-        if (!timeSlot) continue;
+        if (!timeSlot) {
+          candidates.push({
+            key: SKIP_NO_SLOT,
+            detail: `规则「${rule.name}」开启了分时充值，但当前时间没有对应时段`
+          });
+          continue;
+        }
         amount = Number(timeSlot.amount || amount);
         minRoi = Number(timeSlot.minRoi);
       }
 
-      const thresholdHit = account.balance < rule.minBalance && account.roi > minRoi;
-      if (!thresholdHit) continue;
-      if (wasRuleRecentlyDone(account.accountName, rule, null)) continue;
+      if (!(account.balance < rule.minBalance)) {
+        candidates.push({
+          key: SKIP_BALANCE,
+          detail: `余额 ${formatMoney(account.balance)} ≥ ${formatMoney(rule.minBalance)}，未达到充值门槛`
+        });
+        continue;
+      }
 
-      return Object.assign({}, account, {
-        amount,
-        ruleId: rule.id,
-        ruleName: rule.name,
-        ruleDoneKey: makeRuleDoneKey(account.accountName, rule, null),
-        triggerReason: timeSlot
-          ? `分时规则 ${formatSlotRange(timeSlot)}，ROI>${formatRatio(minRoi)}，一次${formatMoney(amount)}`
-          : `余额/ROI规则`,
-        scheduleSlot: null,
-        timeSlotRange: timeSlot ? formatSlotRange(timeSlot) : null
-      });
+      if (!(account.roi > minRoi)) {
+        candidates.push({
+          key: SKIP_ROI,
+          detail: `投产 ${formatRatio(account.roi)} ≤ ${formatRatio(minRoi)}，投产不达标`
+        });
+        continue;
+      }
+
+      if (wasRuleRecentlyDone(account.accountName, rule, null)) {
+        candidates.push({
+          key: SKIP_COOLDOWN,
+          detail: `规则「${rule.name}」冷却 ${formatRatio(rule.cooldownMinutes)} 分钟内已充过`
+        });
+        continue;
+      }
+
+      return {
+        task: Object.assign({}, account, {
+          amount,
+          ruleId: rule.id,
+          ruleName: rule.name,
+          ruleDoneKey: makeRuleDoneKey(account.accountName, rule, null),
+          triggerReason: timeSlot
+            ? `分时规则 ${formatSlotRange(timeSlot)}，ROI>${formatRatio(minRoi)}，一次${formatMoney(amount)}`
+            : `余额/ROI规则`,
+          scheduleSlot: null,
+          timeSlotRange: timeSlot ? formatSlotRange(timeSlot) : null
+        })
+      };
     }
 
-    return null;
+    if (!thresholdRuleCount) {
+      return { skip: { key: SKIP_NO_RULE, detail: '匹配到的规则都没有开启「余额/ROI 自动条件」' } };
+    }
+
+    return { skip: pickSkipReason(candidates) };
+  }
+
+  function buildRechargeTask(account) {
+    return decideAccountRecharge(account).task || null;
   }
 
   function acquireAssignLock() {
@@ -1528,7 +1655,11 @@
   }
 
   function setRechargeLogs(logs) {
-    writeJsonValue(STORAGE_RECHARGE_LOGS, (logs || []).slice(0, 100));
+    writeJsonValue(STORAGE_RECHARGE_LOGS, (logs || []).slice(0, CONFIG.rechargeLogLimit));
+  }
+
+  function makeLogId() {
+    return String(Date.now()) + '_' + Math.random().toString(16).slice(2);
   }
 
   function addRechargeLog(task, status) {
@@ -1536,7 +1667,7 @@
 
     const logs = getRechargeLogs();
     logs.unshift({
-      id: String(Date.now()) + '_' + Math.random().toString(16).slice(2),
+      id: makeLogId(),
       time: Date.now(),
       accountName: task.accountName,
       amount: task.amount,
@@ -1548,6 +1679,149 @@
     setRechargeLogs(logs);
     refreshRechargeLogPanel();
     refreshBudgetPanel();
+  }
+
+  // =========================
+  // 未充值原因记录
+  // 三块数据都不随扫描次数增长：本轮快照每轮覆盖，当天统计只累加次数，原因不变时只累加轮数。
+  // =========================
+  const SKIP_NO_RULE = '未匹配到启用规则';
+  const SKIP_NO_SLOT = '当前时段无分时规则';
+  const SKIP_BALANCE = '余额未达门槛';
+  const SKIP_ROI = '投产不达标';
+  const SKIP_COOLDOWN = '充值冷却中';
+  const SKIP_SLOT_BUDGET = '超出时段累计上限';
+  const SKIP_DAILY_BUDGET = '超出当日推广预算';
+  const SKIP_IN_QUEUE = '已在充值队列中';
+  const SKIP_RECENT_TASK = '刚投递过，防重复';
+  const SKIP_FAILED_COOLDOWN = '失败冷却中';
+
+  // 同一账号可能命中多条规则，取信息量最大的那个原因展示。
+  const SKIP_REASON_PRIORITY = [
+    SKIP_DAILY_BUDGET,
+    SKIP_SLOT_BUDGET,
+    SKIP_FAILED_COOLDOWN,
+    SKIP_IN_QUEUE,
+    SKIP_RECENT_TASK,
+    SKIP_COOLDOWN,
+    SKIP_ROI,
+    SKIP_BALANCE,
+    SKIP_NO_SLOT,
+    SKIP_NO_RULE
+  ];
+
+  function pickSkipReason(candidates) {
+    const list = (candidates || []).filter(Boolean);
+    if (!list.length) return { key: SKIP_NO_RULE, detail: '本轮没有命中任何充值条件' };
+
+    for (const key of SKIP_REASON_PRIORITY) {
+      const hit = list.find(item => item.key === key);
+      if (hit) return hit;
+    }
+
+    return list[0];
+  }
+
+  function getScanSnapshot() {
+    const snapshot = readJsonValue(STORAGE_SCAN_SNAPSHOT, null);
+    if (!snapshot || !snapshot.time) return null;
+    return todayKeyFromTime(snapshot.time) === todayKey() ? snapshot : null;
+  }
+
+  function getSkipReasonStats() {
+    const saved = readJsonValue(STORAGE_SKIP_REASON_STATS, {});
+    if (!saved || saved.date !== todayKey()) return { date: todayKey(), items: {} };
+    return { date: saved.date, items: saved.items || {} };
+  }
+
+  function getSkipReasonState() {
+    const saved = readJsonValue(STORAGE_SKIP_REASON_STATE, {});
+    if (!saved || saved.date !== todayKey()) return { date: todayKey(), map: {} };
+    return { date: saved.date, map: saved.map || {} };
+  }
+
+  function getSkipReasonChanges() {
+    const list = readJsonValue(STORAGE_SKIP_REASON_CHANGES, []);
+    return Array.isArray(list) ? list : [];
+  }
+
+  function setSkipReasonChanges(list) {
+    writeJsonValue(STORAGE_SKIP_REASON_CHANGES, (list || []).slice(0, CONFIG.skipChangeLogLimit));
+  }
+
+  function recordScanOutcome(result) {
+    const now = Date.now();
+    const rows = (result && result.skipRows ? result.skipRows : []).filter(row => row && row.accountName);
+
+    writeJsonValue(STORAGE_SCAN_SNAPSHOT, {
+      time: now,
+      scanned: Math.max(0, Number((result && result.scanned) || 0)),
+      matched: Math.max(0, Number((result && result.matched) || 0)),
+      submitted: Math.max(0, Number((result && result.submitted) || 0)),
+      mode: (result && result.mode) || '正常运行',
+      rows
+    });
+
+    const stats = getSkipReasonStats();
+    const state = getSkipReasonState();
+    const changes = getSkipReasonChanges();
+    const seen = {};
+
+    rows.forEach(row => {
+      const key = row.reasonKey || SKIP_NO_RULE;
+      const item = stats.items[key] || { count: 0, lastTime: 0, accounts: [] };
+      item.count = Number(item.count || 0) + 1;
+      item.lastTime = now;
+      if (item.accounts.indexOf(row.accountName) < 0) item.accounts.push(row.accountName);
+      stats.items[key] = item;
+
+      const nameKey = normalizeText(row.accountName);
+      seen[nameKey] = true;
+      const previous = state.map[nameKey];
+
+      if (previous && previous.reasonKey === key) {
+        previous.rounds = Number(previous.rounds || 1) + 1;
+        previous.lastTime = now;
+        const entry = changes.find(change => change.id === previous.changeId);
+        if (entry) {
+          entry.rounds = previous.rounds;
+          entry.detail = row.reasonDetail || entry.detail;
+        }
+        return;
+      }
+
+      const changeId = makeLogId();
+      changes.unshift({
+        id: changeId,
+        time: now,
+        accountName: row.accountName,
+        fromReason: previous ? previous.reasonKey : '',
+        toReason: key,
+        detail: row.reasonDetail || '',
+        rounds: 1
+      });
+      state.map[nameKey] = { reasonKey: key, rounds: 1, changeId, lastTime: now };
+    });
+
+    // 本轮已充值或已不在跳过名单里的账号，结束它的原因状态，下次再跳过会重新记一条。
+    Object.keys(state.map).forEach(nameKey => {
+      if (!seen[nameKey]) delete state.map[nameKey];
+    });
+
+    writeJsonValue(STORAGE_SKIP_REASON_STATS, stats);
+    writeJsonValue(STORAGE_SKIP_REASON_STATE, state);
+    setSkipReasonChanges(changes);
+    refreshRechargeLogPanel();
+  }
+
+  function makeSkipRow(account, reason, extraDetail) {
+    return {
+      accountName: (account && account.accountName) || '',
+      balance: Number((account && account.balance) || 0),
+      roi: Number((account && account.roi) || 0),
+      reasonKey: reason.key,
+      reasonDetail: extraDetail ? `${reason.detail}${extraDetail}` : reason.detail
+    };
   }
 
   function formatMoney(value) {
@@ -1577,19 +1851,53 @@
     }));
   }
 
+  // 时段和累计上限都可以在工作台「店铺分时规则」页自行修改，这里只做清洗和排序。
   function normalizeBudgetSlots(slots) {
-    const defaults = defaultBudgetSlots();
     const list = Array.isArray(slots) ? slots : [];
 
-    return defaults.map((base, index) => {
-      const item = list[index] || {};
-      const percent = Number(item.percent != null ? item.percent : base.percent);
+    const cleaned = list.map(item => {
+      const startRaw = Number((item || {}).startHour);
+      const endRaw = Number((item || {}).endHour);
+      const percentRaw = Number((item || {}).percent);
+      const startHour = Math.max(0, Math.min(23, Number.isFinite(startRaw) ? Math.round(startRaw) : 0));
+      const endHour = Math.max(startHour + 1, Math.min(24, Number.isFinite(endRaw) ? Math.round(endRaw) : startHour + 1));
+
       return {
-        startHour: base.startHour,
-        endHour: base.endHour,
-        percent: Math.max(0, Math.min(100, Number.isFinite(percent) ? percent : base.percent))
+        startHour,
+        endHour,
+        percent: Math.max(0, Math.min(100, Number.isFinite(percentRaw) ? percentRaw : 0))
       };
+    }).filter(slot => slot.endHour > slot.startHour);
+
+    if (!cleaned.length) return defaultBudgetSlots();
+
+    return cleaned.sort((a, b) => a.startHour - b.startHour || a.endHour - b.endHour);
+  }
+
+  function getBudgetSlotIssues(slots) {
+    const list = normalizeBudgetSlots(slots);
+    const issues = [];
+
+    list.forEach((slot, index) => {
+      const previous = list[index - 1];
+      if (!previous) return;
+      if (slot.startHour !== previous.endHour) {
+        issues.push(`${formatSlotRange(previous)} 和 ${formatSlotRange(slot)} 之间时间不连续`);
+      }
+      if (slot.percent < previous.percent) {
+        issues.push(`${formatSlotRange(slot)} 的累计上限 ${formatRatio(slot.percent)}% 低于上一个时段，累计上限应逐段增大`);
+      }
     });
+
+    if (list.length && list[0].startHour !== 0) {
+      issues.push('第一个时段建议从 00:00 开始，否则 00:00 之后到第一个时段之前不受预算控制');
+    }
+
+    if (list.length && list[list.length - 1].endHour !== 24) {
+      issues.push('最后一个时段建议到 24:00 结束，否则当天最后一段不受预算控制');
+    }
+
+    return issues;
   }
 
   function defaultBudgetSettings() {
@@ -1695,11 +2003,31 @@
     }, 0);
   }
 
+  function isMetricsFromToday(metrics) {
+    const snapshot = metrics || getShopMetricsSnapshot();
+    if (!snapshot) return false;
+    const snapshotDate = snapshot.date || (snapshot.time ? todayKeyFromTime(snapshot.time) : '');
+    return !snapshotDate || snapshotDate === todayKey();
+  }
+
+  // 跨天后京小洁页面常常还显示昨天的数据。凌晨读到的花费和昨天总花费几乎一样时，判为过期读数。
+  function isStaleSpendReading(metrics) {
+    const spend = Number((metrics && metrics.spend) || 0);
+    if (!(spend > 0)) return false;
+    if (new Date().getHours() >= CONFIG.staleSpendGuardUntilHour) return false;
+
+    const yesterday = getShopDailyGmvMap()[yesterdayKey(todayKey())];
+    const yesterdaySpend = Number((yesterday && yesterday.spend) || 0);
+    if (!(yesterdaySpend > 0)) return false;
+
+    return spend >= yesterdaySpend * CONFIG.staleSpendRatio;
+  }
+
   function getTodaySpendAmount(metrics) {
     const snapshot = metrics || getShopMetricsSnapshot();
     if (!snapshot) return 0;
-    const snapshotDate = snapshot.date || (snapshot.time ? todayKeyFromTime(snapshot.time) : '');
-    if (snapshotDate && snapshotDate !== todayKey()) return 0;
+    if (!isMetricsFromToday(snapshot)) return 0;
+    if (snapshot.staleSpend) return 0;
     const spend = Number(snapshot.spend || 0);
     return Number.isFinite(spend) && spend > 0 ? spend : 0;
   }
@@ -1711,8 +2039,10 @@
     const saved = readJsonValue(STORAGE_BUDGET_USED_SEED, {});
     let amount = saved.date === today ? Math.max(0, Number(saved.amount || 0)) : 0;
 
-    // 当天还没有脚本充值记录时，用页面已消耗作为已用基数，并随消耗抬高。
-    if (!(submitted > 0) && spend > amount) {
+    if (!(submitted > 0)) {
+      // 当天还没有脚本充值记录时，已用基数跟随页面已消耗；页面切到新一天后要能跟着降下来。
+      amount = spend;
+    } else if (spend > amount) {
       amount = spend;
     }
 
@@ -1813,6 +2143,14 @@
       ? Object.assign({}, shopRowMetrics, { accountCount: childMetrics.accountCount })
       : childMetrics;
 
+    if (isStaleSpendReading(metrics)) {
+      showStatus(
+        `当前页面花费 ${formatMoney(metrics.spend)} 元和昨天总花费几乎一致，判断页面还没切到新的一天。\n` +
+        '本次不更新店铺花费数据，今日已用金额仍按 0 起算。'
+      );
+      return Object.assign({}, metrics, { staleSpend: true });
+    }
+
     writeJsonValue(STORAGE_SHOP_METRIC_SNAPSHOT, metrics);
 
     const daily = getShopDailyGmvMap();
@@ -1836,6 +2174,7 @@
     const item = settings || getBudgetSettings();
     const snapshot = metrics || getShopMetricsSnapshot();
     if (!snapshot) return false;
+    if (!isMetricsFromToday(snapshot)) return false; // 昨天的投产不能用来放开今天的预算。
     return Number(snapshot.roi || 0) >= Number(item.targetShopRoi || 0);
   }
 
@@ -2060,16 +2399,120 @@
     return `<div style="color:${color};">${lines.map(item => `<div>${escapeHtml(item)}</div>`).join('')}</div>`;
   }
 
-  function budgetSlotInputsHtml() {
+  function budgetSlotSummaryHtml() {
+    const settings = getBudgetSettings();
+    const slots = getBudgetSlots(settings);
+
     return `
-      <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:8px;">
-        ${getBudgetSlots().map((slot, index) => `
-          <label style="font-size:12px;color:#4b5563;">${escapeHtml(formatSlotRange(slot))} 上限%
-            <input id="jxj-budget-slot-${index}" type="number" min="0" max="100" step="1" value="${escapeHtml(slot.percent)}" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;">
-          </label>
-        `).join('')}
+      <div style="margin-top:10px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
+        <div style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:6px;">
+          分时累计上限已移到左侧「店铺分时规则」页，可自行增删时段、修改时间和比例。当前设置：
+        </div>
+        <div style="font-size:12px;color:#334155;line-height:1.7;">
+          ${slots.map(slot => `${escapeHtml(formatSlotRange(slot))} ${escapeHtml(formatRatio(slot.percent))}% / ${escapeHtml(formatMoney(getSlotBudgetAmount(settings, slot)))} 元`).join('；')}
+        </div>
+        <button type="button" data-action="goto-slots" style="margin-top:8px;padding:6px 10px;border:1px solid #0f766e;background:#fff;color:#0f766e;border-radius:6px;cursor:pointer;font-size:12px;">去修改分时规则</button>
       </div>
     `;
+  }
+
+  function budgetSlotRowsHtml(slots) {
+    const settings = getBudgetSettings();
+    const list = slots || getBudgetSlots(settings);
+
+    return list.map((slot, index) => `
+      <div class="jxj-slot-row" data-slot-index="${index}" style="display:grid;grid-template-columns:88px 88px 104px minmax(0,1fr) 72px;gap:8px;align-items:center;margin-bottom:8px;">
+        <input type="number" min="0" max="23" step="1" data-slot-field="startHour" value="${escapeHtml(slot.startHour)}" style="height:32px;box-sizing:border-box;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;">
+        <input type="number" min="1" max="24" step="1" data-slot-field="endHour" value="${escapeHtml(slot.endHour)}" style="height:32px;box-sizing:border-box;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;">
+        <input type="number" min="0" max="100" step="1" data-slot-field="percent" value="${escapeHtml(slot.percent)}" style="height:32px;box-sizing:border-box;padding:5px 8px;border:1px solid #d1d5db;border-radius:6px;">
+        <div class="jxj-slot-amount" style="font-size:12px;color:#334155;line-height:1.5;">${escapeHtml(formatSlotRange(slot))} 累计不超过 <b>${escapeHtml(formatMoney(getSlotBudgetAmount(settings, slot)))}</b> 元</div>
+        <button type="button" data-action="delete-slot" style="padding:6px 8px;border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:6px;cursor:pointer;font-size:12px;">删除</button>
+      </div>
+    `).join('');
+  }
+
+  function budgetSlotHintHtml(slots) {
+    const issues = getBudgetSlotIssues(slots);
+
+    if (!issues.length) {
+      return '<span style="color:#15803d;">时段连续、累计上限逐段增大，可以保存。保存后总览「时段对照」会同步更新。</span>';
+    }
+
+    return `<span style="color:#b45309;">保存前请检查：${issues.map(escapeHtml).join('；')}</span>`;
+  }
+
+  function budgetSlotPageHtml() {
+    const settings = getBudgetSettings();
+
+    return `
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
+        <div style="font-weight:800;margin-bottom:6px;">分时累计上限</div>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:10px;">
+          这是<b>累计</b>上限，不是各时段相加。例如到 09:00-14:00 这一段，当天累计充值不超过当天预算的对应比例。
+          当天预算 <b id="jxj-slot-daily-budget">${escapeHtml(formatMoney(getDailyBudgetAmount(settings)))}</b> 元，改动会实时换算金额。
+        </div>
+        <div style="display:grid;grid-template-columns:88px 88px 104px minmax(0,1fr) 72px;gap:8px;font-size:12px;color:#475569;font-weight:700;margin-bottom:6px;">
+          <div>开始</div><div>结束</div><div>累计上限%</div><div>累计金额</div><div>操作</div>
+        </div>
+        <div id="jxj-slot-rows">${budgetSlotRowsHtml()}</div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center;">
+          <button type="button" data-action="add-slot" style="padding:7px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">新增时段</button>
+          <button type="button" data-action="reset-slots" style="padding:7px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">恢复默认</button>
+          <button type="button" data-action="save-slots" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存分时规则</button>
+        </div>
+        <div id="jxj-slot-hint" style="font-size:12px;line-height:1.6;margin-top:10px;">${budgetSlotHintHtml()}</div>
+      </div>
+    `;
+  }
+
+  function readBudgetSlotsFromPanel(panel) {
+    const box = panel && panel.querySelector('#jxj-slot-rows');
+    if (!box) return getBudgetSlots();
+
+    const rows = [...box.querySelectorAll('.jxj-slot-row')];
+    if (!rows.length) return getBudgetSlots();
+
+    return rows.map(row => ({
+      startHour: Number((row.querySelector('[data-slot-field="startHour"]') || {}).value || 0),
+      endHour: Number((row.querySelector('[data-slot-field="endHour"]') || {}).value || 0),
+      percent: Number((row.querySelector('[data-slot-field="percent"]') || {}).value || 0)
+    }));
+  }
+
+  function refreshBudgetSlotPage(options) {
+    const panel = document.getElementById('jxj-rule-panel');
+    if (!panel) return;
+
+    const rowsBox = panel.querySelector('#jxj-slot-rows');
+    const rerender = !!(options && options.rerender);
+    const slots = rerender ? (options.slots || getBudgetSlots()) : readBudgetSlotsFromPanel(panel);
+
+    if (rowsBox && rerender) {
+      rowsBox.innerHTML = budgetSlotRowsHtml(normalizeBudgetSlots(slots));
+    } else if (rowsBox) {
+      // 输入过程中不重建输入框，只更新每行右侧的换算金额，避免打字被打断，也不按排序错位。
+      const settings = getBudgetSettings();
+      [...rowsBox.querySelectorAll('.jxj-slot-row')].forEach(row => {
+        const label = row.querySelector('.jxj-slot-amount');
+        if (!label) return;
+
+        const slot = {
+          startHour: Number((row.querySelector('[data-slot-field="startHour"]') || {}).value || 0),
+          endHour: Number((row.querySelector('[data-slot-field="endHour"]') || {}).value || 0),
+          percent: Number((row.querySelector('[data-slot-field="percent"]') || {}).value || 0)
+        };
+
+        label.innerHTML = slot.endHour > slot.startHour
+          ? `${escapeHtml(formatSlotRange(slot))} 累计不超过 <b>${escapeHtml(formatMoney(getSlotBudgetAmount(settings, slot)))}</b> 元`
+          : '<span style="color:#b91c1c;">结束时间要大于开始时间</span>';
+      });
+    }
+
+    const budgetBox = panel.querySelector('#jxj-slot-daily-budget');
+    if (budgetBox) budgetBox.innerText = formatMoney(getDailyBudgetAmount(getBudgetSettings()));
+
+    const hint = panel.querySelector('#jxj-slot-hint');
+    if (hint) hint.innerHTML = budgetSlotHintHtml(slots);
   }
 
   function fillBudgetSettingsInputs(panel, settings) {
@@ -2086,10 +2529,8 @@
     if (returnRate && document.activeElement !== returnRate) returnRate.value = item.returnRatePercent ? String(item.returnRatePercent) : '';
     if (targetRoi && document.activeElement !== targetRoi) targetRoi.value = String(item.targetShopRoi);
 
-    getBudgetSlots(item).forEach((slot, index) => {
-      const input = panel && panel.querySelector('#jxj-budget-slot-' + index);
-      if (input && document.activeElement !== input) input.value = String(slot.percent);
-    });
+    const summary = panel && panel.querySelector('#jxj-budget-slot-summary');
+    if (summary) summary.innerHTML = budgetSlotSummaryHtml();
   }
 
   function readBudgetSettingsFromPanel(panel) {
@@ -2101,9 +2542,8 @@
       combinedFeePercent: Number((panel.querySelector('#jxj-budget-combined-fee') || {}).value || 0),
       returnRatePercent: Number((panel.querySelector('#jxj-budget-return-rate') || {}).value || 0),
       targetShopRoi: Number((panel.querySelector('#jxj-budget-target-roi') || {}).value || CONFIG.targetShopRoi),
-      budgetSlots: defaultBudgetSlots().map((slot, index) => Object.assign({}, slot, {
-        percent: Number((panel.querySelector('#jxj-budget-slot-' + index) || {}).value || slot.percent)
-      }))
+      // 分时上限只由「店铺分时规则」页的保存按钮写入，避免在预算页误存未确认的改动。
+      budgetSlots: getBudgetSettings().budgetSlots
     });
   }
 
@@ -2128,14 +2568,225 @@
     refreshOverviewDashboard();
   }
 
-  function rechargeLogRowsHtml() {
-    const logs = getRechargeLogs();
+  function logCardStyle() {
+    return 'background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:10px;';
+  }
 
-    if (!logs.length) {
-      return '<div style="padding:10px;color:#777;background:#fff;border:1px solid #eee;border-radius:6px;">暂无充值提交记录</div>';
+  function logTableStyle() {
+    return 'width:100%;border-collapse:collapse;font-size:12px;';
+  }
+
+  function logThStyle() {
+    return 'text-align:left;padding:7px 8px;border-bottom:1px solid #e2e8f0;background:#f8fafc;color:#475569;font-weight:700;';
+  }
+
+  function logTdStyle() {
+    return 'padding:7px 8px;border-bottom:1px solid #eef2f7;vertical-align:top;';
+  }
+
+  function scanSnapshotHtml() {
+    const snapshot = getScanSnapshot();
+
+    if (!snapshot) {
+      return `
+        <div style="${logCardStyle()}">
+          <div style="font-weight:800;margin-bottom:6px;">本轮未充值原因（每轮覆盖，不累积）</div>
+          <div style="font-size:12px;color:#64748b;line-height:1.6;">今天还没有扫描记录。在京小洁投放明细页执行一次查询后，这里会显示每个子账号本轮为什么没充。</div>
+        </div>
+      `;
+    }
+
+    const rows = snapshot.rows || [];
+    const limit = CONFIG.scanSnapshotVisibleRows;
+    const visibleRows = scanSnapshotExpanded ? rows : rows.slice(0, limit);
+    const hiddenCount = rows.length - visibleRows.length;
+
+    const body = rows.length
+      ? `
+        <table style="${logTableStyle()}">
+          <thead>
+            <tr>
+              <th style="${logThStyle()}">子账号</th>
+              <th style="${logThStyle()}text-align:right;">余额</th>
+              <th style="${logThStyle()}text-align:right;">投产</th>
+              <th style="${logThStyle()}">本轮为什么没充</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${visibleRows.map(row => `
+              <tr>
+                <td style="${logTdStyle()}">${escapeHtml(row.accountName)}</td>
+                <td style="${logTdStyle()}text-align:right;">${escapeHtml(formatMoney(row.balance))}</td>
+                <td style="${logTdStyle()}text-align:right;">${escapeHtml(formatRatio(row.roi))}</td>
+                <td style="${logTdStyle()}color:#334155;">${escapeHtml(row.reasonDetail || row.reasonKey || '')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+        ${rows.length > limit ? `
+          <div style="margin-top:8px;">
+            <button type="button" data-action="toggle-scan-rows" style="padding:6px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;font-size:12px;">
+              ${scanSnapshotExpanded ? '收起' : `展开全部 ${rows.length} 个`}${hiddenCount > 0 ? `（还有 ${hiddenCount} 个）` : ''}
+            </button>
+          </div>
+        ` : ''}
+      `
+      : '<div style="font-size:12px;color:#15803d;">本轮所有账号都已按规则处理，没有被跳过的账号。</div>';
+
+    return `
+      <div style="${logCardStyle()}">
+        <div style="font-weight:800;margin-bottom:6px;">本轮未充值原因（每轮覆盖，不累积）</div>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:8px;">
+          ${escapeHtml(formatDateTime(snapshot.time))} ${escapeHtml(snapshot.mode || '正常运行')}：
+          扫描 ${escapeHtml(snapshot.scanned)} 个子账号，命中规则 ${escapeHtml(snapshot.matched)} 个，投递 ${escapeHtml(snapshot.submitted)} 个，未充值 ${escapeHtml(rows.length)} 个。下一轮会覆盖这一块。
+        </div>
+        ${body}
+      </div>
+    `;
+  }
+
+  function skipReasonStatsHtml() {
+    const stats = getSkipReasonStats();
+    const keys = Object.keys(stats.items || {});
+
+    if (!keys.length) {
+      return `
+        <div style="${logCardStyle()}">
+          <div style="font-weight:800;margin-bottom:6px;">当天未充值原因统计（按原因聚合）</div>
+          <div style="font-size:12px;color:#64748b;line-height:1.6;">今天还没有未充值记录。</div>
+        </div>
+      `;
+    }
+
+    const sorted = keys
+      .map(key => Object.assign({ key }, stats.items[key]))
+      .sort((a, b) => Number(b.count || 0) - Number(a.count || 0));
+
+    return `
+      <div style="${logCardStyle()}">
+        <div style="font-weight:800;margin-bottom:6px;">当天未充值原因统计（按原因聚合）</div>
+        <table style="${logTableStyle()}">
+          <thead>
+            <tr>
+              <th style="${logThStyle()}">原因</th>
+              <th style="${logThStyle()}text-align:right;">出现次数</th>
+              <th style="${logThStyle()}">最后一次</th>
+              <th style="${logThStyle()}">涉及账号</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sorted.map(item => {
+              const accounts = item.accounts || [];
+              const accountText = accounts.length > 3
+                ? `${accounts.slice(0, 3).join('、')} 等 ${accounts.length} 个`
+                : accounts.join('、');
+              return `
+                <tr>
+                  <td style="${logTdStyle()}font-weight:700;color:#0f172a;">${escapeHtml(item.key)}</td>
+                  <td style="${logTdStyle()}text-align:right;">${escapeHtml(item.count)}</td>
+                  <td style="${logTdStyle()}">${escapeHtml(item.lastTime ? formatDateTime(item.lastTime) : '')}</td>
+                  <td style="${logTdStyle()}color:#334155;">${escapeHtml(accountText)}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-top:8px;">一天固定就这几行，扫描再多也不会变长，次数只累加数字。</div>
+      </div>
+    `;
+  }
+
+  function skipReasonChangesHtml() {
+    const changes = getSkipReasonChanges();
+
+    if (!changes.length) {
+      return `
+        <div style="${logCardStyle()}">
+          <div style="font-weight:800;margin-bottom:6px;">未充值原因变化（只在原因变化时记一条）</div>
+          <div style="font-size:12px;color:#64748b;line-height:1.6;">还没有原因变化记录。</div>
+        </div>
+      `;
     }
 
     return `
+      <div style="${logCardStyle()}">
+        <div style="font-weight:800;margin-bottom:6px;">未充值原因变化（只在原因变化时记一条）</div>
+        <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:8px;">
+          同一个账号连续多轮都是同一个原因时不重复记录，只累加「持续轮数」；原因换了才追加一条。保留最近 ${escapeHtml(CONFIG.skipChangeLogLimit)} 条。
+        </div>
+        <table style="${logTableStyle()}">
+          <thead>
+            <tr>
+              <th style="${logThStyle()}">时间</th>
+              <th style="${logThStyle()}">子账号</th>
+              <th style="${logThStyle()}">原因变化</th>
+              <th style="${logThStyle()}text-align:right;">持续</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${changes.map(change => `
+              <tr>
+                <td style="${logTdStyle()}white-space:nowrap;">${escapeHtml(formatDateTime(change.time))}</td>
+                <td style="${logTdStyle()}">${escapeHtml(change.accountName)}</td>
+                <td style="${logTdStyle()}color:#334155;">
+                  ${change.fromReason ? `${escapeHtml(change.fromReason)} → ` : '（首次记录）'}<b>${escapeHtml(change.toReason)}</b>
+                  ${change.detail ? `<div style="color:#64748b;margin-top:2px;">${escapeHtml(change.detail)}</div>` : ''}
+                </td>
+                <td style="${logTdStyle()}text-align:right;white-space:nowrap;">已 ${escapeHtml(change.rounds || 1)} 轮</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function rechargeLogKind(log) {
+    const status = String((log && log.status) || '已提交');
+    if (status.indexOf('已提交') === 0) return 'ok';
+    if (status.indexOf('失败') === 0) return 'fail';
+    return 'system';
+  }
+
+  function rechargeLogKindMeta(kind) {
+    if (kind === 'ok') return { text: '已提交', bg: '#dcfce7', color: '#15803d' };
+    if (kind === 'fail') return { text: '失败', bg: '#fee2e2', color: '#b91c1c' };
+    return { text: '系统', bg: '#dbeafe', color: '#1e40af' };
+  }
+
+  function rechargeLogFilterHtml() {
+    const items = [
+      { id: 'all', label: '全部' },
+      { id: 'ok', label: '已充值' },
+      { id: 'fail', label: '失败' },
+      { id: 'system', label: '系统' }
+    ];
+
+    return `
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;">
+        ${items.map(item => {
+          const active = rechargeLogFilter === item.id;
+          return `<button type="button" data-action="filter-logs" data-filter="${item.id}" style="padding:5px 12px;border:1px solid ${active ? '#2563eb' : '#cbd5e1'};background:${active ? '#2563eb' : '#fff'};color:${active ? '#fff' : '#334155'};border-radius:999px;font-size:12px;cursor:pointer;font-weight:${active ? 700 : 500};">${escapeHtml(item.label)}</button>`;
+        }).join('')}
+      </div>
+    `;
+  }
+
+  function rechargeLogRowsHtml() {
+    const logs = getRechargeLogs()
+      .filter(log => rechargeLogFilter === 'all' || rechargeLogKind(log) === rechargeLogFilter);
+
+    if (!logs.length) {
+      return `
+        ${rechargeLogFilterHtml()}
+        <div style="padding:10px;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;">
+          ${rechargeLogFilter === 'all' ? '暂无充值动作记录' : '当前筛选下没有记录'}
+        </div>
+      `;
+    }
+
+    return `
+      ${rechargeLogFilterHtml()}
       <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e5e5;font-size:12px;">
         <thead>
           <tr style="background:#fafafa;">
@@ -2147,21 +2798,33 @@
           </tr>
         </thead>
         <tbody>
-          ${logs.map(log => `
+          ${logs.map(log => {
+            const meta = rechargeLogKindMeta(rechargeLogKind(log));
+            return `
             <tr>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;white-space:nowrap;">${escapeHtml(formatDateTime(log.time))}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(log.accountName)}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;text-align:right;">${escapeHtml(log.amount)}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(log.ruleName)} / ${escapeHtml(log.triggerReason)}</td>
-              <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(log.status || '已提交')}</td>
+              <td style="padding:6px;border-bottom:1px solid #f0f0f0;white-space:nowrap;"><span style="padding:2px 8px;border-radius:999px;background:${meta.bg};color:${meta.color};font-weight:700;">${escapeHtml(log.status || '已提交')}</span></td>
             </tr>
-          `).join('')}
+          `;
+          }).join('')}
         </tbody>
       </table>
     `;
   }
 
   function refreshRechargeLogPanel() {
+    const scanBox = document.getElementById('jxj-scan-snapshot');
+    if (scanBox) scanBox.innerHTML = scanSnapshotHtml();
+
+    const statsBox = document.getElementById('jxj-skip-reason-stats');
+    if (statsBox) statsBox.innerHTML = skipReasonStatsHtml();
+
+    const changesBox = document.getElementById('jxj-skip-reason-changes');
+    if (changesBox) changesBox.innerHTML = skipReasonChangesHtml();
+
     const box = document.getElementById('jxj-recharge-log-rows');
     if (box) box.innerHTML = rechargeLogRowsHtml();
 
@@ -3011,7 +3674,7 @@
         if (task.ruleDoneKey) done[task.ruleDoneKey] = Date.now();
       });
       setRuleDoneMap(done);
-      const added = addTasks(pendingTasks);
+      const added = addTasks(pendingTasks).added;
 
       showStatus(
         `固定时间到点，已投递 ${added}/${pendingTasks.length} 个充值任务：\n` +
@@ -3041,6 +3704,7 @@
   const WORKSPACE_PAGES = [
     { id: 'overview', label: '总览' },
     { id: 'budget', label: '店铺预算' },
+    { id: 'slots', label: '店铺分时规则' },
     { id: 'rules', label: '充值规则' },
     { id: 'queue', label: '充值队列' },
     { id: 'logs', label: '提交记录' },
@@ -3324,6 +3988,7 @@
 
     if (pageId === 'overview') refreshOverviewDashboard();
     if (pageId === 'budget') refreshBudgetPanel({ fillInputs: true });
+    if (pageId === 'slots') refreshBudgetSlotPage({ rerender: true });
     if (pageId === 'queue') {
       refreshQueuePanel();
       refreshSimulationPanel();
@@ -3370,7 +4035,7 @@
     showStatus(shopWide ? '已新增一条全店规则，保存后对本店所有子账号生效' : '已新增一条分账号规则，请填写完整子账号名称后保存');
   }
 
-  function handleWorkspaceAction(panel, action) {
+  function handleWorkspaceAction(panel, action, actionEl) {
     if (action === 'close-panel') {
       rulePanelVisible = false;
       panel.style.display = 'none';
@@ -3379,8 +4044,84 @@
     if (action === 'goto-rules') return switchWorkspacePage('rules');
     if (action === 'goto-logs') return switchWorkspacePage('logs');
     if (action === 'goto-budget') return switchWorkspacePage('budget');
+    if (action === 'goto-slots') return switchWorkspacePage('slots');
     if (action === 'goto-queue') return switchWorkspacePage('queue');
     if (action === 'goto-versions') return switchWorkspacePage('versions');
+
+    if (action === 'toggle-scan-rows') {
+      scanSnapshotExpanded = !scanSnapshotExpanded;
+      refreshRechargeLogPanel();
+      return;
+    }
+
+    if (action === 'filter-logs') {
+      rechargeLogFilter = (actionEl && actionEl.getAttribute('data-filter')) || 'all';
+      refreshRechargeLogPanel();
+      return;
+    }
+
+    if (action === 'add-slot') {
+      const slots = readBudgetSlotsFromPanel(panel);
+      const last = slots[slots.length - 1];
+      const startHour = last ? Number(last.endHour) : 0;
+
+      if (startHour >= 24) {
+        showStatus('已经排到 24:00，无法再新增时段。可以先把最后一个时段的结束时间改小。');
+        return;
+      }
+
+      slots.push({
+        startHour,
+        endHour: Math.min(24, startHour + 2),
+        percent: last ? Number(last.percent) : 20
+      });
+      refreshBudgetSlotPage({ rerender: true, slots });
+      showStatus('已新增一个时段，改好时间和累计上限后请点「保存分时规则」。');
+      return;
+    }
+
+    if (action === 'delete-slot') {
+      const row = actionEl && actionEl.closest('.jxj-slot-row');
+      if (!row) return;
+
+      const slots = readBudgetSlotsFromPanel(panel);
+      const index = Number(row.getAttribute('data-slot-index'));
+
+      if (slots.length <= 1) {
+        showStatus('至少要保留一个时段。');
+        return;
+      }
+
+      slots.splice(index, 1);
+      refreshBudgetSlotPage({ rerender: true, slots });
+      showStatus('已删除该时段，请点「保存分时规则」生效。');
+      return;
+    }
+
+    if (action === 'reset-slots') {
+      if (!window.confirm('确定把分时规则恢复成默认的 0-9 点 15%、9-14 点 45%、14-18 点 60%、18-24 点 100% 吗？')) return;
+      refreshBudgetSlotPage({ rerender: true, slots: defaultBudgetSlots() });
+      showStatus('已恢复默认分时规则，请点「保存分时规则」生效。');
+      return;
+    }
+
+    if (action === 'save-slots') {
+      const slots = normalizeBudgetSlots(readBudgetSlotsFromPanel(panel));
+      const issues = getBudgetSlotIssues(slots);
+
+      if (issues.length && !window.confirm(`分时规则存在以下问题：\n${issues.join('\n')}\n\n仍要保存吗？`)) {
+        return;
+      }
+
+      saveBudgetSettings(Object.assign({}, getBudgetSettings(), { budgetSlots: slots }));
+      refreshBudgetSlotPage({ rerender: true });
+      refreshOverviewDashboard();
+      showStatus(
+        `已保存 ${slots.length} 个分时上限：\n` +
+        slots.map(slot => `${formatSlotRange(slot)} ${formatRatio(slot.percent)}% / ${formatMoney(getSlotBudgetAmount(getBudgetSettings(), slot))} 元`).join('\n')
+      );
+      return;
+    }
     if (action === 'import-accounts') return importCurrentExpandedAccountRules(panel);
     if (action === 'apply-bulk-rule') return applyBulkRuleUpdate(panel);
     if (action === 'save-budget') {
@@ -3446,10 +4187,15 @@
       return;
     }
     if (action === 'clear-logs') {
-      if (!window.confirm('确定清空充值提交记录吗？')) return;
+      if (!window.confirm('确定清空这一页的所有记录吗？包括本轮未充值原因、当天原因统计、原因变化和充值动作日志。')) return;
       setRechargeLogs([]);
+      GM_deleteValue(STORAGE_SCAN_SNAPSHOT);
+      GM_deleteValue(STORAGE_SKIP_REASON_STATS);
+      GM_deleteValue(STORAGE_SKIP_REASON_STATE);
+      GM_deleteValue(STORAGE_SKIP_REASON_CHANGES);
+      scanSnapshotExpanded = false;
       refreshRechargeLogPanel();
-      showStatus('已清空充值提交记录');
+      showStatus('已清空充值动作日志和未充值原因记录');
     }
   }
 
@@ -3567,12 +4313,15 @@
                     <input id="jxj-budget-target-roi" type="number" min="0" step="0.1" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;">
                   </label>
                 </div>
-                ${budgetSlotInputsHtml()}
+                <div id="jxj-budget-slot-summary">${budgetSlotSummaryHtml()}</div>
                 <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px;margin-top:8px;flex-wrap:wrap;">
                   <div id="jxj-budget-summary" style="font-size:12px;line-height:1.55;color:#334155;flex:1;"></div>
                   <button type="button" data-action="save-budget" style="padding:7px 12px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;">保存预算</button>
                 </div>
               </div>
+            </div>
+            <div data-workspace-page="slots" style="display:none;">
+              ${budgetSlotPageHtml()}
             </div>
             <div data-workspace-page="rules" style="display:none;">
               ${ruleScopeGuideHtml()}
@@ -3605,8 +4354,12 @@
               </div>
             </div>
             <div data-workspace-page="logs" style="display:none;">
+              <div id="jxj-scan-snapshot">${scanSnapshotHtml()}</div>
+              <div id="jxj-skip-reason-stats">${skipReasonStatsHtml()}</div>
+              <div id="jxj-skip-reason-changes">${skipReasonChangesHtml()}</div>
               <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;">
-                <div style="font-size:12px;color:#64748b;line-height:1.5;margin-bottom:8px;">这里记录脚本已提交的转入操作，不是平台最终到账确认。</div>
+                <div style="font-weight:800;margin-bottom:6px;">充值动作日志（只记真实动作）</div>
+                <div style="font-size:12px;color:#64748b;line-height:1.5;margin-bottom:8px;">只有已提交、失败、预算未提交、跨天重置会写进这里，保留最近 ${escapeHtml(CONFIG.rechargeLogLimit)} 条。这里是脚本已提交的转入操作，不是平台最终到账确认。</div>
                 <div id="jxj-recharge-budget-hint" style="font-size:12px;color:#475569;line-height:1.5;margin-bottom:8px;"></div>
                 <div id="jxj-recharge-log-rows">${rechargeLogRowsHtml()}</div>
                 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
@@ -3700,7 +4453,7 @@
 
       const actionEl = event.target.closest('[data-action]');
       if (!actionEl || !panel.contains(actionEl)) return;
-      handleWorkspaceAction(panel, actionEl.getAttribute('data-action'));
+      handleWorkspaceAction(panel, actionEl.getAttribute('data-action'), actionEl);
     });
 
     const bulkField = panel.querySelector('#jxj-bulk-rule-field');
@@ -3776,7 +4529,6 @@
     });
 
     ['jxj-budget-enabled', 'jxj-budget-avg-gmv', 'jxj-budget-combined-fee', 'jxj-budget-return-rate', 'jxj-budget-target-roi']
-      .concat(getBudgetSlots().map((_, index) => 'jxj-budget-slot-' + index))
       .forEach(id => {
       const input = panel.querySelector('#' + id);
       if (!input) return;
@@ -3785,6 +4537,10 @@
     });
 
     panel.addEventListener('input', event => {
+      if (event.target.closest('.jxj-slot-row')) {
+        refreshBudgetSlotPage();
+        return;
+      }
       if (event.target.closest('.jxj-rule-row')) {
         refreshRuleConflictPanel(readRulesFromPanel(panel));
       }
@@ -4221,9 +4977,13 @@
   function handleAccounts(accounts) {
     updateShopMetricsSnapshot(accounts);
 
-    const matched = accounts
-      .map(buildRechargeTask)
-      .filter(Boolean);
+    const list = accounts || [];
+    const decisions = list.map(account => ({ account, result: decideAccountRecharge(account) }));
+    const matched = decisions.filter(item => item.result.task).map(item => item.result.task);
+    const skipRows = decisions
+      .filter(item => item.result.skip)
+      .map(item => makeSkipRow(item.account, item.result.skip));
+
     const budgeted = prepareTasksWithDailyBudget(matched);
     const targets = budgeted.tasks;
     const budgetText = budgeted.messages.length ? `\n${budgeted.messages.join('\n')}` : '';
@@ -4231,25 +4991,46 @@
       ? `\n预算跳过：${budgeted.skipped.map(item => `${item.accountName} ${item.amount}元`).join('、')}`
       : '';
 
+    budgeted.skipped.forEach(item => {
+      const reason = String(item.skipReason || '');
+      skipRows.push(makeSkipRow(item, {
+        key: reason.indexOf('当日') >= 0 ? SKIP_DAILY_BUDGET : SKIP_SLOT_BUDGET,
+        detail: `${reason}，本次需 ${formatMoney(item.amount)} 元`
+      }));
+    });
+
     console.log('读取到的店铺子账号：', accounts);
     console.log('按规则命中的充值任务：', matched);
     console.log('预算控制后的充值任务：', targets);
+
+    const recordOutcome = (submitted, mode, extraRows) => {
+      recordScanOutcome({
+        scanned: list.length,
+        matched: matched.length,
+        submitted,
+        mode,
+        skipRows: skipRows.concat(extraRows || [])
+      });
+    };
 
     if (!matched.length) {
       if (isDryRun()) {
         setSimulationResults([], '模拟规则检测', budgeted);
       }
+      recordOutcome(0, isDryRun() ? '模拟运行' : '正常运行');
       showStatus('检查完成：没有命中规则的充值账号' + budgetText);
       return;
     }
 
     if (isPaused()) {
+      recordOutcome(0, '已暂停');
       showStatus(`已暂停自动充值：本轮检测到 ${matched.length} 个命中账号，但不会投递任务` + budgetText);
       return;
     }
 
     if (isDryRun()) {
       setSimulationResults(targets, '模拟规则检测', budgeted);
+      recordOutcome(targets.length, '模拟运行');
       showStatus(
         `模拟运行：规则命中 ${matched.length} 个，预算后可投递 ${targets.length} 个，不会打开充值页、不提交充值。\n` +
         targets.map(item => `${item.accountName}，预计 ${item.amount} 元，${item.ruleName}`).join('\n') +
@@ -4260,13 +5041,17 @@
     }
 
     if (!targets.length) {
+      recordOutcome(0, '正常运行');
       showStatus('检查完成：有账号命中规则，但受当日推广预算限制，未投递充值任务' + skippedText + budgetText);
       return;
     }
 
-    const added = addTasks(targets);
+    const addResult = addTasks(targets);
+    const added = addResult.added;
     const current = getCurrent();
     const queue = getQueue();
+
+    recordOutcome(added, '正常运行', addResult.skipRows);
 
     showStatus(
       `发现 ${matched.length} 个符合条件账号，预算后投递 ${targets.length} 个。\n` +
@@ -4301,6 +5086,7 @@
       return;
     }
 
+    resetDailyStateIfNewDay(); // 每轮开始先确认有没有跨天，避免昨天的已用金额挡住今天的充值。
     isChecking = true;
 
     try {
@@ -4995,6 +5781,13 @@
     observer.observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  // 页面长时间不关时，也要在 0 点自动重置，不用等下一轮查询。
+  function startDailyResetWatcher() {
+    if (dailyResetTimerStarted) return;
+    dailyResetTimerStarted = true;
+    setInterval(resetDailyStateIfNewDay, 60 * 1000); // 每分钟检查一次日期是否变了。
+  }
+
   function notifyNewVersionIfNeeded() {
     if (!hasUnreadVersion()) return;
     const latest = getLatestVersionEntry();
@@ -5023,6 +5816,8 @@
       migrateRuntimeStateIfNeeded();
       renderRulePanel();
       renderRechargeLogPanel();
+      resetDailyStateIfNewDay();
+      startDailyResetWatcher();
       startRuleScheduler();
       watchUrlChanges();
       watchDomRemount();
