@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.8.1
+// @version      5.9.3
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -118,7 +118,7 @@
   const ARRIVAL_NA = 'na'; // 失败或系统记录，不需要核对
 
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.8.1';
+  const SCRIPT_VERSION = '5.9.3';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -126,6 +126,48 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.9.3',
+      date: '2026-08-21',
+      type: 'fix',
+      title: '规则改叫智能充值和定时充值',
+      items: [
+        '「自动条件」改名为「智能充值」：余额低、投产够就自动补',
+        '「固定时间」改名为「定时充值」：到你写的钟点再充'
+      ]
+    },
+    {
+      version: '5.9.2',
+      date: '2026-08-21',
+      type: 'fix',
+      title: '去掉规则名称输入框',
+      items: [
+        '充值规则不再手写名称。全店、分组、账号由类型和适用对象自动识别，日志里也会写成「分组规则 · 爆款组」这类'
+      ]
+    },
+    {
+      version: '5.9.1',
+      date: '2026-08-21',
+      type: 'fix',
+      title: '分组预算改成填写金额后立刻能输入',
+      items: [
+        '「未分组」和新建分组默认就是填写金额，不再先锁成「不限制」',
+        '预算方式从「不限制」改成「填写金额」或百分比后，当天预算框马上可以输入，不用先保存再进一次页面'
+      ]
+    },
+    {
+      version: '5.9.0',
+      date: '2026-08-21',
+      type: 'feature',
+      title: '店铺预算双模式、分时开关、分组预算和三级规则',
+      items: [
+        '店铺预算可在「智能店铺预算」和「固定店铺预算」里二选一：智能按近七天业绩×费比计算，固定由你手写当天金额',
+        '分时预算可以关闭；关闭后全店只按当天店铺预算跑，不再被时段上限卡住',
+        '「分组与账号额度」改名为「分组与账号预算」：分组按金额填写，合计应对齐当天店铺预算',
+        '分时开启时，分组当天预算仍按当前时段比例使用；分时关闭后，分组按全天金额使用',
+        '充值规则分成三级：全店规则、分组规则、账号规则，同一个号只走最细的一条（账号 > 分组 > 全店）'
+      ]
+    },
     {
       version: '5.8.1',
       date: '2026-08-21',
@@ -993,7 +1035,7 @@
       rule.accountPattern
     );
 
-    if (!rules.length) return '暂无固定时间任务';
+    if (!rules.length) return '暂无定时充值任务';
 
     const now = new Date();
     const currentMinutes = minutesOfDay(now.getHours(), now.getMinutes());
@@ -1024,7 +1066,7 @@
       }
     }
 
-    if (!best) return '暂无有效固定时间任务';
+    if (!best) return '暂无有效定时充值任务';
     return `${best.text}：${best.accountName}，${best.amount}元`;
   }
 
@@ -1036,7 +1078,7 @@
           <div style="color:#111827;">${escapeHtml(getNextAdCheckText())}</div>
         </div>
         <div style="padding:9px 10px;background:#fff;border:1px solid #e6eaf0;border-left:3px solid #13c2c2;border-radius:6px;">
-          <div style="font-weight:700;color:#3b4350;margin-bottom:3px;">下个固定时间充值</div>
+          <div style="font-weight:700;color:#3b4350;margin-bottom:3px;">下个定时充值</div>
           <div style="color:#111827;">${escapeHtml(getNextScheduleText())}</div>
         </div>
       </div>
@@ -1125,7 +1167,7 @@
 
     markTaskFailureCooldown(task.accountName, reason);
     addRechargeLog(Object.assign({}, task, {
-      triggerReason: `${task.triggerReason || '余额/ROI规则'}；失败原因：${reason || '未知失败'}`
+      triggerReason: `${task.triggerReason || '智能充值'}；失败原因：${reason || '未知失败'}`
     }), `失败，已跳过（重试${retryCount}/${maxRetry}）`);
     refreshQueuePanel();
     showStatus(`任务失败次数已达上限，已跳过：${task.accountName}\n原因：${reason || '未知失败'}\n重试次数：${retryCount}/${maxRetry}`);
@@ -1153,8 +1195,9 @@
       id: 'default_shop_all_rule', // 默认规则ID，一般不要改；改了会被当成一条新规则。
       enabled: true, // 默认启用这条规则；false表示默认关闭。
       name: '全店默认规则', // 规则面板里显示的规则名称；这条是全店规则，不是某个子账号专用。
-      matchType: 'all', // 匹配方式：all=本店全部子账号，exact=精确匹配，prefix=前缀匹配，contains=包含匹配。
-      accountPattern: '', // all模式不需要填写账号名；脚本只会读取工作台里填写的店铺名称下面的子账号。
+      matchType: 'all', // 匹配方式：all=全店，group=分组，exact=账号精确，prefix=前缀，contains=包含。
+      groupId: '', // 分组规则用的分组ID；全店和账号规则留空。
+      accountPattern: '', // 账号规则填写子账号名；全店和分组规则不用填。
       amount: CONFIG.rechargeAmount, // 默认充值金额，来自顶部CONFIG.rechargeAmount。
       useThreshold: true, // 是否启用“余额/ROI自动条件”；false表示只按固定时间等其他方式处理。
       minBalance: CONFIG.minBalance, // 自动条件：余额小于这个值才触发，默认来自CONFIG.minBalance。
@@ -1253,20 +1296,34 @@
     return null;
   }
 
+  function autoRuleName(rule) {
+    const item = rule || {};
+    const matchType = item.matchType || 'all';
+    if (matchType === 'all') return '全店规则';
+    if (matchType === 'group') {
+      const group = getAccountGroup(item.groupId);
+      return group && group.name ? `分组规则 · ${group.name}` : '分组规则';
+    }
+    const pattern = String(item.accountPattern || '').trim();
+    if (matchType === 'prefix') return pattern ? `账号前缀 · ${pattern}` : '账号规则 · 前缀';
+    if (matchType === 'contains') return pattern ? `账号包含 · ${pattern}` : '账号规则 · 包含';
+    return pattern ? `账号规则 · ${pattern}` : '账号规则';
+  }
+
   function normalizeRule(rule) {
     const base = defaultRule();
     const item = Object.assign({}, base, rule || {});
 
     item.id = item.id || makeRuleId();
     item.enabled = item.enabled !== false;
-    item.name = String(item.name || '未命名规则');
     if (item.id === 'default_prefix_rule') {
       item.id = 'default_shop_all_rule';
       item.matchType = 'all';
       item.accountPattern = '';
     }
 
-    item.matchType = ['all', 'exact', 'prefix', 'contains'].includes(item.matchType) ? item.matchType : 'exact';
+    item.matchType = ['all', 'group', 'exact', 'prefix', 'contains'].includes(item.matchType) ? item.matchType : 'exact';
+    item.groupId = String(item.groupId || '');
     item.accountPattern = String(item.accountPattern || '').trim();
     item.amount = Number(item.amount || CONFIG.rechargeAmount);
     item.useThreshold = item.useThreshold !== false;
@@ -1278,6 +1335,7 @@
     item.cooldownMinutes = Math.max(0, Number(item.cooldownMinutes || 0));
     item.useTimeSlots = !!item.useTimeSlots;
     item.timeSlots = normalizeRuleTimeSlots(item.timeSlots, item.amount, item.minRoi);
+    item.name = autoRuleName(item);
 
     return item;
   }
@@ -1304,8 +1362,18 @@
     writeJsonValue(STORAGE_RULE_DONE_MAP, doneMap || {});
   }
 
+  function getAccountGroupId(accountName) {
+    const roster = findRosterAccount(accountName);
+    return roster && roster.groupId ? roster.groupId : UNGROUPED_ID;
+  }
+
   function matchRuleAccount(rule, accountName) {
     if (rule.matchType === 'all') return !!normalizeText(accountName);
+
+    if (rule.matchType === 'group') {
+      const groupId = String(rule.groupId || '');
+      return !!groupId && getAccountGroupId(accountName) === groupId;
+    }
 
     const pattern = normalizeText(rule.accountPattern);
     const account = normalizeText(accountName);
@@ -1330,6 +1398,9 @@
 
     const containsRules = matchedRules.filter(rule => rule.matchType === 'contains');
     if (containsRules.length > 0) return containsRules;
+
+    const groupRules = matchedRules.filter(rule => rule.matchType === 'group');
+    if (groupRules.length > 0) return groupRules;
 
     return matchedRules.filter(rule => rule.matchType === 'all');
   }
@@ -1455,7 +1526,7 @@
           ruleDoneKey: makeRuleDoneKey(account.accountName, rule, null),
           triggerReason: timeSlot
             ? `分时规则 ${formatSlotRange(timeSlot)}，ROI>${formatRatio(minRoi)}，一次${formatMoney(amount)}`
-            : `余额/ROI规则`,
+            : `智能充值`,
           scheduleSlot: null,
           timeSlotRange: timeSlot ? formatSlotRange(timeSlot) : null
         })
@@ -1463,7 +1534,7 @@
     }
 
     if (!thresholdRuleCount) {
-      return { skip: { key: SKIP_NO_RULE, detail: '匹配到的规则都没有开启「余额/ROI 自动条件」' } };
+      return { skip: { key: SKIP_NO_RULE, detail: '匹配到的规则都没有开启「智能充值」' } };
     }
 
     return { skip: pickSkipReason(candidates) };
@@ -1678,7 +1749,7 @@
         `${index + 1}. ${task.accountName}`,
         `   充值金额：${formatNotifyMetric(task.amount, '元')}`,
         `   充值前余额：${formatNotifyMetric(task.balance, '元')}，花费：${formatNotifyMetric(task.spend, '元')}，投产：${formatNotifyMetric(task.roi, '')}`,
-        `   规则：${task.ruleName || '默认'} / ${task.triggerReason || '余额/ROI规则'}`
+        `   规则：${task.ruleName || '默认'} / ${task.triggerReason || '智能充值'}`
       );
     });
 
@@ -1787,13 +1858,13 @@
       accountName: task.accountName,
       amount: task.amount,
       ruleName: task.ruleName || '默认',
-      triggerReason: task.triggerReason || '余额/ROI规则',
+      triggerReason: task.triggerReason || '智能充值',
       status: finalStatus,
       // 到账核对用的基准：提交那一刻这个子账号的余额和今日累计花费。
       balanceBefore: hasBaseline ? Number(task.balance) : null,
       spendBefore: hasBaseline ? Number(task.spend) : null,
       arrivalState: submitted ? (hasBaseline ? ARRIVAL_PENDING : ARRIVAL_UNKNOWN) : ARRIVAL_NA,
-      arrivalNote: submitted && !hasBaseline ? '这笔没有余额基准（例如固定时间充值），无法自动核对' : '',
+      arrivalNote: submitted && !hasBaseline ? '这笔没有余额基准（例如定时充值），无法自动核对' : '',
       arrivalCheckedAt: 0
     });
 
@@ -2049,7 +2120,7 @@
   // =========================
   function defaultAccountGroups() {
     return [
-      { id: UNGROUPED_ID, name: '未分组', quotaMode: 'none', quotaValue: 0, amount: null, minRoi: null }
+      { id: UNGROUPED_ID, name: '未分组', quotaMode: 'fixed', quotaValue: 0, amount: null, minRoi: null }
     ];
   }
 
@@ -2194,12 +2265,14 @@
     return budget * Math.max(0, Number(item.quotaValue || 0)) / 100;
   }
 
-  // 分组沿用店铺那套分时比例，不单独配置。
+  // 分时开启时，分组沿用店铺那套分时比例；关闭后按分组全天金额用。
   function getGroupSlotQuota(group, settings, slot) {
     const daily = getGroupDailyQuota(group, settings);
     if (daily === null) return null;
 
     const item = settings || getBudgetSettings();
+    if (!isSlotBudgetEnabled(item)) return daily;
+
     const currentSlot = slot || getCurrentBudgetSlot(item);
     const percent = Number((currentSlot && currentSlot.percent) || 0);
     if (!(percent > 0)) return 0;
@@ -2403,10 +2476,13 @@
   function defaultBudgetSettings() {
     return {
       enabled: true, // 是否启用店铺当天预算控制。
-      avgGmv7d: 0, // 近七天平均业绩，单位元。
+      budgetMode: 'smart', // smart=智能店铺预算（业绩×费比），fixed=固定店铺预算（手写当天金额），只能选一个。
+      avgGmv7d: 0, // 近七天平均业绩，单位元。智能模式用。
       combinedFeePercent: 0, // 推广和退货合计费比，按百分数填写，例如 15 表示 15%。
       returnRatePercent: 0, // 店铺退货率，按百分数填写，例如 8 表示 8%。
+      fixedDailyBudget: 0, // 固定模式下手写的当天预算，单位元。
       targetShopRoi: CONFIG.targetShopRoi, // 店铺投产达标值，当前店铺投产大于等于该值才可能允许超预算。
+      slotBudgetEnabled: true, // 是否启用分时预算。关闭后全店只按当天店铺预算跑。
       budgetSlots: defaultBudgetSlots() // 分时累计上限，百分比对应当天预算。
     };
   }
@@ -2414,10 +2490,13 @@
   function normalizeBudgetSettings(settings) {
     const item = Object.assign({}, defaultBudgetSettings(), settings || {});
     item.enabled = item.enabled !== false;
+    item.budgetMode = item.budgetMode === 'fixed' ? 'fixed' : 'smart';
     item.avgGmv7d = Math.max(0, Number(item.avgGmv7d || 0));
     item.combinedFeePercent = Math.max(0, Number(item.combinedFeePercent || 0));
     item.returnRatePercent = Math.max(0, Number(item.returnRatePercent || 0));
+    item.fixedDailyBudget = Math.max(0, Number(item.fixedDailyBudget || 0));
     item.targetShopRoi = Math.max(0, Number(item.targetShopRoi || CONFIG.targetShopRoi));
+    item.slotBudgetEnabled = item.slotBudgetEnabled !== false;
     item.budgetSlots = normalizeBudgetSlots(item.budgetSlots);
     return item;
   }
@@ -2436,11 +2515,25 @@
     return Number(item.combinedFeePercent || 0) - Number(item.returnRatePercent || 0);
   }
 
-  function getDailyBudgetAmount(settings) {
+  function getSmartDailyBudgetAmount(settings) {
     const item = settings || getBudgetSettings();
     const feePercent = getPromotionFeePercent(item);
     if (!(item.avgGmv7d > 0) || !(feePercent > 0)) return 0;
     return item.avgGmv7d * feePercent / 100;
+  }
+
+  function isFixedBudgetMode(settings) {
+    return (settings || getBudgetSettings()).budgetMode === 'fixed';
+  }
+
+  function isSlotBudgetEnabled(settings) {
+    return (settings || getBudgetSettings()).slotBudgetEnabled !== false;
+  }
+
+  function getDailyBudgetAmount(settings) {
+    const item = settings || getBudgetSettings();
+    if (isFixedBudgetMode(item)) return Math.max(0, Number(item.fixedDailyBudget || 0));
+    return getSmartDailyBudgetAmount(item);
   }
 
   function getBudgetSlots(settings) {
@@ -2481,6 +2574,7 @@
 
   function isBudgetConfigured(settings) {
     const item = settings || getBudgetSettings();
+    if (isFixedBudgetMode(item)) return Number(item.fixedDailyBudget) > 0;
     return Number(item.avgGmv7d) > 0 && Number(item.combinedFeePercent) > 0;
   }
 
@@ -2709,8 +2803,9 @@
     const used = counted + pending;
     const budget = getDailyBudgetAmount(settings);
     const slot = getCurrentBudgetSlot(settings);
-    const slotBudget = getSlotBudgetAmount(settings, slot);
-    const cap = Math.min(Number(budget || 0), Number(slotBudget || 0));
+    const slotEnabled = isSlotBudgetEnabled(settings);
+    const slotBudget = slotEnabled ? getSlotBudgetAmount(settings, slot) : Number(budget || 0);
+    const cap = slotEnabled ? Math.min(Number(budget || 0), Number(slotBudget || 0)) : Number(budget || 0);
     const remaining = Math.max(0, cap - used);
     const dailyRemaining = Math.max(0, Number(budget || 0) - used);
     const configured = isBudgetConfigured(settings);
@@ -2731,6 +2826,7 @@
       usedFromSpend,
       budget,
       slot,
+      slotEnabled,
       slotBudget,
       cap,
       remaining,
@@ -2763,20 +2859,26 @@
 
     if (!decision.active) {
       if (decision.settings.enabled === false) {
-        messages.push('店铺预算控制已关闭，本次不限制店铺总额，仍按分组额度和账号上限控制');
+        messages.push('店铺预算控制已关闭，本次不限制店铺总额，仍按分组预算和账号上限控制');
       } else {
-        messages.push('尚未填写近七天平均业绩和合计费比，本次不限制店铺总额，仍按分组额度和账号上限控制');
+        messages.push(isFixedBudgetMode(decision.settings)
+          ? '尚未填写当天固定预算，本次不限制店铺总额，仍按分组预算和账号上限控制'
+          : '尚未填写近七天平均业绩和合计费比，本次不限制店铺总额，仍按分组预算和账号上限控制');
       }
       return passShopLevel();
     }
 
     if (decision.canExceed) {
-      messages.push(`店铺投产达标（${formatRatio(decision.metrics && decision.metrics.roi)} ≥ ${formatRatio(decision.settings.targetShopRoi)}），允许超过当前时段上限 ${formatMoney(decision.slotBudget)} 元和当天预算 ${formatMoney(decision.budget)} 元；分组额度和账号上限仍然生效`);
+      messages.push(
+        decision.slotEnabled
+          ? `店铺投产达标（${formatRatio(decision.metrics && decision.metrics.roi)} ≥ ${formatRatio(decision.settings.targetShopRoi)}），允许超过当前时段上限 ${formatMoney(decision.slotBudget)} 元和当天预算 ${formatMoney(decision.budget)} 元；分组预算和账号上限仍然生效`
+          : `店铺投产达标（${formatRatio(decision.metrics && decision.metrics.roi)} ≥ ${formatRatio(decision.settings.targetShopRoi)}），允许超过当天预算 ${formatMoney(decision.budget)} 元；分组预算和账号上限仍然生效`
+      );
       return passShopLevel();
     }
 
     if (!(decision.cap > 0) && !decision.canExceed) {
-      const slotText = decision.slot ? `，当前时段 ${formatSlotRange(decision.slot)} 上限 ${formatMoney(decision.slotBudget)} 元` : '';
+      const slotText = decision.slotEnabled && decision.slot ? `，当前时段 ${formatSlotRange(decision.slot)} 上限 ${formatMoney(decision.slotBudget)} 元` : '';
       messages.push(`当日推广预算为 ${formatMoney(decision.budget)} 元${slotText}，且投产未达标，本次不投递充值任务`);
       return {
         tasks: [],
@@ -2791,10 +2893,10 @@
 
     let remaining = decision.remaining;
     const kept = [];
-    const shopSkipReason = decision.used >= decision.budget
+    const shopSkipReason = !decision.slotEnabled || decision.used >= decision.budget
       ? '超出当日推广预算'
       : `超出当前时段 ${formatSlotRange(decision.slot)} 预算上限`;
-    const shopSkipLevel = decision.used >= decision.budget ? 'daily' : 'slot';
+    const shopSkipLevel = !decision.slotEnabled || decision.used >= decision.budget ? 'daily' : 'slot';
 
     for (const task of list) {
       const amount = Number(task.amount || 0);
@@ -2811,7 +2913,7 @@
           amount: adjustedAmount,
           originalAmount: amount,
           budgetAdjusted: true,
-          triggerReason: `${task.triggerReason || '余额/ROI规则'}（${formatSlotRange(decision.slot)} 预算截断 ${formatMoney(amount)}→${formatMoney(adjustedAmount)}）`
+          triggerReason: `${task.triggerReason || '智能充值'}（${formatSlotRange(decision.slot)} 预算截断 ${formatMoney(amount)}→${formatMoney(adjustedAmount)}）`
         }));
         messages.push(`${task.accountName} 受当前时段预算限制，充值金额从 ${formatMoney(amount)} 元调整为 ${formatMoney(adjustedAmount)} 元`);
         remaining = 0;
@@ -2824,7 +2926,9 @@
       }));
     }
 
-    const slotText = `当前时段 ${formatSlotRange(decision.slot)} 上限 ${formatMoney(decision.slotBudget)} 元（当天预算 ${formatMoney(decision.budget)} 的 ${formatRatio(decision.slot && decision.slot.percent)}%）`;
+    const slotText = decision.slotEnabled
+      ? `当前时段 ${formatSlotRange(decision.slot)} 上限 ${formatMoney(decision.slotBudget)} 元（当天预算 ${formatMoney(decision.budget)} 的 ${formatRatio(decision.slot && decision.slot.percent)}%）`
+      : `分时预算已关闭，按当天店铺预算 ${formatMoney(decision.budget)} 元控制`;
     if (skipped.length) {
       messages.push(`${slotText}，已用 ${formatMoney(decision.counted)} 元，队列中 ${formatMoney(decision.pending)} 元，剩余不足，已跳过 ${skipped.length} 个账号`);
     } else if (decision.used > 0 || kept.length) {
@@ -2915,7 +3019,7 @@
           amount: adjustedAmount,
           originalAmount: amount,
           budgetAdjusted: true,
-          triggerReason: `${task.triggerReason || '余额/ROI规则'}（${tightest.level === 'group' ? '分组额度' : '账号上限'}截断 ${formatMoney(amount)}→${formatMoney(adjustedAmount)}）`
+          triggerReason: `${task.triggerReason || '智能充值'}（${tightest.level === 'group' ? '分组额度' : '账号上限'}截断 ${formatMoney(amount)}→${formatMoney(adjustedAmount)}）`
         }));
         messages.push(`${task.accountName} 受${tightest.level === 'group' ? '分组额度' : '账号当天上限'}限制，充值金额从 ${formatMoney(amount)} 元调整为 ${formatMoney(adjustedAmount)} 元`);
         continue;
@@ -2973,24 +3077,35 @@
     const metrics = decision.metrics;
     const lines = [];
 
-    lines.push(`推广费比 ${formatRatio(decision.promotionFeePercent)}% ＝ 合计费比 ${formatRatio(settings.combinedFeePercent)}% − 退货率 ${formatRatio(settings.returnRatePercent)}%`);
-    lines.push(`当天预算 ${formatMoney(decision.budget)} 元 ＝ 近七天平均业绩 ${formatMoney(settings.avgGmv7d)} × 推广费比 ${formatRatio(decision.promotionFeePercent)}%`);
+    if (isFixedBudgetMode(settings)) {
+      lines.push(`当前策略：固定店铺预算，当天预算 ${formatMoney(decision.budget)} 元（手写）`);
+    } else {
+      lines.push(`当前策略：智能店铺预算`);
+      lines.push(`推广费比 ${formatRatio(decision.promotionFeePercent)}% ＝ 合计费比 ${formatRatio(settings.combinedFeePercent)}% − 退货率 ${formatRatio(settings.returnRatePercent)}%`);
+      lines.push(`当天预算 ${formatMoney(decision.budget)} 元 ＝ 近七天平均业绩 ${formatMoney(settings.avgGmv7d)} × 推广费比 ${formatRatio(decision.promotionFeePercent)}%`);
+    }
 
-    const slotLines = getBudgetSlots(settings).map(slot => {
-      const amount = getSlotBudgetAmount(settings, slot);
-      const currentMark = sameBudgetSlot(slot, decision.slot) ? '（当前）' : '';
-      return `${formatSlotRange(slot)} ${formatRatio(slot.percent)}% / ${formatMoney(amount)}元${currentMark}`;
-    });
-    if (slotLines.length) {
-      lines.push(`分时累计上限：${slotLines.join('；')}`);
+    if (!isSlotBudgetEnabled(settings)) {
+      lines.push('分时预算已关闭，全店只按当天店铺预算控制。');
+    } else {
+      const slotLines = getBudgetSlots(settings).map(slot => {
+        const amount = getSlotBudgetAmount(settings, slot);
+        const currentMark = sameBudgetSlot(slot, decision.slot) ? '（当前）' : '';
+        return `${formatSlotRange(slot)} ${formatRatio(slot.percent)}% / ${formatMoney(amount)}元${currentMark}`;
+      });
+      if (slotLines.length) {
+        lines.push(`分时累计上限：${slotLines.join('；')}`);
+      }
     }
 
     if (!decision.configured) {
-      lines.push('请先填写近七天平均业绩和合计费比；未填写时不限制充值金额。');
+      lines.push(isFixedBudgetMode(settings) ? '请先填写当天固定预算；未填写时不限制充值金额。' : '请先填写近七天平均业绩和合计费比；未填写时不限制充值金额。');
     } else if (!decision.active) {
       lines.push('预算控制已关闭，当前不限制当天充值总额。');
     } else {
-      lines.push(`当前时段 ${formatSlotRange(decision.slot)} 正常上限 ${formatMoney(decision.slotBudget)} 元（当天预算的 ${formatRatio(decision.slot && decision.slot.percent)}%）`);
+      if (decision.slotEnabled) {
+        lines.push(`当前时段 ${formatSlotRange(decision.slot)} 正常上限 ${formatMoney(decision.slotBudget)} 元（当天预算的 ${formatRatio(decision.slot && decision.slot.percent)}%）`);
+      }
       const usedText = decision.usedFromSpend
         ? `今日已用 ${formatMoney(decision.counted)} 元（无脚本充值记录，按已消耗 ${formatMoney(decision.consumed)} 元起算），队列中 ${formatMoney(decision.pending)} 元`
         : `今日已用 ${formatMoney(decision.counted)} 元（脚本已充 ${formatMoney(decision.submitted)} 元，已消耗 ${formatMoney(decision.consumed)} 元），队列中 ${formatMoney(decision.pending)} 元`;
@@ -3007,7 +3122,7 @@
       lines.push(`投产达标：${decision.roiOk ? '是' : '否'}（目标 ≥ ${formatRatio(settings.targetShopRoi)}）`);
       lines.push(decision.canExceed
         ? '店铺投产已达标，允许超过当前时段上限和当天预算。'
-        : '店铺投产未达标，按分时累计上限控制充值，18:00 后可用满当天预算。');
+        : (decision.slotEnabled ? '店铺投产未达标，按分时累计上限控制充值，18:00 后可用满当天预算。' : '店铺投产未达标，按当天店铺预算控制充值。'));
     } else {
       lines.push('尚未读取到店铺花费/投产数据；可在京小洁投放明细页执行一次查询后刷新这里。');
     }
@@ -3024,7 +3139,7 @@
     return `
       <div style="margin-top:10px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
         <div style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:6px;">
-          分时累计上限已移到左侧「店铺分时规则」页，可自行增删时段、修改时间和比例。当前设置：
+          ${isSlotBudgetEnabled(settings) ? '分时预算已开启。可到「② 分时预算」增删时段、改时间和比例。当前设置：' : '分时预算已关闭，全店只按当天店铺预算跑。时段表仍保留，下次开启继续用。当前设置：'}
         </div>
         <div style="font-size:12px;color:#334155;line-height:1.7;">
           ${slots.map(slot => `${escapeHtml(formatSlotRange(slot))} ${escapeHtml(formatRatio(slot.percent))}% / ${escapeHtml(formatMoney(getSlotBudgetAmount(settings, slot)))} 元`).join('；')}
@@ -3050,6 +3165,10 @@
   }
 
   function budgetSlotHintHtml(slots) {
+    if (!isSlotBudgetEnabled()) {
+      return '<span style="color:#0f766e;">分时预算已关闭，全店只按当天店铺预算跑。时段表仍保留，保存时不会按这些上限卡充值。</span>';
+    }
+
     const issues = getBudgetSlotIssues(slots);
 
     if (!issues.length) {
@@ -3066,7 +3185,7 @@
     return `
       ${workspaceStepBarHtml('accounts')}
       <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
-        第 3 步：把这个店的子账号从页面拉下来存成名单，再按需要分组。分好组，第 4 步才能按组分配额度。
+        第 3 步：把这个店的子账号从页面拉下来存成名单，再按需要分组。分好组，第 4 步才能按组填写预算。
       </div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
@@ -3228,36 +3347,36 @@
   }
 
   // =========================
-  // ④ 分组与账号额度
+  // ④ 分组与账号预算
   // =========================
   function allocationPageHtml() {
     return `
       ${workspaceStepBarHtml('alloc')}
       <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
-        第 4 步：在店铺预算和分时上限之内，从大到小往下分配。分组和单账号都可以设额度，也可以只设条件。
+        第 4 步：给每个分组填写当天预算金额，所有分组相加应对齐第 1 步的当天店铺预算。一次充多少、ROI 多少，请到第 5 步用全店 / 分组 / 账号规则设置。
       </div>
       <div id="jxj-alloc-chain">${allocationChainHtml()}</div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
-          <span style="padding:2px 8px;border-radius:999px;background:#dbeafe;color:#1e40af;font-size:11px;font-weight:700;">第 3 级</span>
-          <div style="font-weight:800;">分组额度与条件</div>
-          <span style="font-size:12px;color:#64748b;margin-left:auto;">优先于全店规则</span>
+          <span style="padding:2px 8px;border-radius:999px;background:#dbeafe;color:#1e40af;font-size:11px;font-weight:700;">分组预算</span>
+          <div style="font-weight:800;">分组当天预算</div>
+          <span style="font-size:12px;color:#64748b;margin-left:auto;">填写金额，合计 = 当天店铺预算</span>
         </div>
         <div id="jxj-group-quota-rows">${groupQuotaRowsHtml()}</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">
           <span id="jxj-group-quota-sum" style="font-size:12px;line-height:1.6;"></span>
-          <button type="button" data-action="save-allocation" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存额度设置</button>
+          <button type="button" data-action="save-allocation" style="margin-left:auto;padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">保存分组预算</button>
         </div>
       </div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
-          <span style="padding:2px 8px;border-radius:999px;background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;">第 4 级</span>
-          <div style="font-weight:800;">单个账号额度与条件</div>
-          <span style="font-size:12px;color:#64748b;margin-left:auto;">优先级最高，只影响这一个账号</span>
+          <span style="padding:2px 8px;border-radius:999px;background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;">账号预算</span>
+          <div style="font-weight:800;">单个账号当天上限</div>
+          <span style="font-size:12px;color:#64748b;margin-left:auto;">只限制这一个账号今天最多充多少</span>
         </div>
         <div id="jxj-account-quota-rows">${accountQuotaRowsHtml()}</div>
         <div style="font-size:12px;color:#64748b;line-height:1.6;margin-top:8px;">
-          留空就跟随所在分组；分组也没设就跟随全店规则。额度从大到小卡：店铺当天预算 → 当前分时上限 → 分组额度 → 账号当天上限，取最小。
+          留空表示不单独限制。分时开启时，分组预算还会按当前时段比例使用；分时关闭后，分组按全天金额使用。
         </div>
         ${nextStepButtonHtml('alloc')}
       </div>
@@ -3281,9 +3400,11 @@
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:10px;">
         <div style="font-weight:800;margin-bottom:8px;">当前可分配额度</div>
         <div style="display:flex;align-items:stretch;gap:8px;flex-wrap:wrap;">
-          ${node('第 1 级 · 店铺', '当天总预算', `${formatMoney(decision.budget)} 元`, '近七天平均业绩 × 推广费比')}
+          ${node('第 1 级 · 店铺', isFixedBudgetMode(settings) ? '固定当天预算' : '智能当天预算', `${formatMoney(decision.budget)} 元`, isFixedBudgetMode(settings) ? '手写当天金额' : '近七天平均业绩 × 推广费比')}
           <div style="align-self:center;color:#94a3b8;font-weight:800;">›</div>
-          ${node('第 2 级 · 分时', `当前时段 ${formatSlotRange(decision.slot)}`, `${formatMoney(decision.slotBudget)} 元`, `已用 ${formatMoney(decision.counted)} 元，还能分配 ${formatMoney(decision.remaining)} 元`)}
+          ${decision.slotEnabled
+            ? node('第 2 级 · 分时', `当前时段 ${formatSlotRange(decision.slot)}`, `${formatMoney(decision.slotBudget)} 元`, `已用 ${formatMoney(decision.counted)} 元，还能分配 ${formatMoney(decision.remaining)} 元`)
+            : node('第 2 级 · 分时', '分时预算已关闭', `${formatMoney(decision.budget)} 元`, '全店按当天店铺预算跑，分组按全天金额用')}
         </div>
       </div>
     `;
@@ -3301,12 +3422,10 @@
           <tr>
             <th style="${logThStyle()}width:140px;">分组</th>
             <th style="${logThStyle()}width:70px;">账号数</th>
-            <th style="${logThStyle()}width:150px;">额度方式</th>
-            <th style="${logThStyle()}width:90px;">数值</th>
-            <th style="${logThStyle()}width:110px;">当天额度</th>
-            <th style="${logThStyle()}width:90px;">一次充值</th>
-            <th style="${logThStyle()}width:90px;">投产高于</th>
-            <th style="${logThStyle()}">当前时段还能充</th>
+            <th style="${logThStyle()}width:150px;">预算方式</th>
+            <th style="${logThStyle()}width:110px;">当天预算</th>
+            <th style="${logThStyle()}width:110px;">折算金额</th>
+            <th style="${logThStyle()}">当前还能充</th>
           </tr>
         </thead>
         <tbody>
@@ -3323,25 +3442,19 @@
                 <td style="${logTdStyle()}">${escapeHtml(count)} 个</td>
                 <td style="${logTdStyle()}">
                   <select data-group-field="quotaMode" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                    <option value="fixed" ${group.quotaMode === 'fixed' ? 'selected' : ''}>填写金额</option>
                     <option value="percent" ${group.quotaMode === 'percent' ? 'selected' : ''}>按店铺预算百分比</option>
-                    <option value="fixed" ${group.quotaMode === 'fixed' ? 'selected' : ''}>固定金额</option>
                     <option value="none" ${group.quotaMode === 'none' ? 'selected' : ''}>不限制</option>
                   </select>
                 </td>
                 <td style="${logTdStyle()}">
-                  <input type="number" min="0" step="1" data-group-field="quotaValue" value="${escapeHtml(group.quotaValue)}" ${group.quotaMode === 'none' ? 'disabled' : ''} style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
+                  <input type="number" min="0" step="1" data-group-field="quotaValue" value="${group.quotaMode === 'none' ? '' : escapeHtml(group.quotaValue)}" ${group.quotaMode === 'none' ? 'disabled' : ''} placeholder="${group.quotaMode === 'percent' ? '%' : '填写金额'}" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;background:${group.quotaMode === 'none' ? '#f8fafc' : '#fff'};">
                 </td>
                 <td style="${logTdStyle()}" class="jxj-group-quota-amount">${daily === null ? '<span style="color:#94a3b8;">不限</span>' : `${escapeHtml(formatMoney(daily))} 元`}</td>
-                <td style="${logTdStyle()}">
-                  <input type="number" min="0" step="1" data-group-field="amount" value="${group.amount === null ? '' : escapeHtml(group.amount)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
-                </td>
-                <td style="${logTdStyle()}">
-                  <input type="number" min="0" step="0.1" data-group-field="minRoi" value="${group.minRoi === null ? '' : escapeHtml(group.minRoi)}" placeholder="跟随" style="width:100%;height:30px;padding:4px 6px;border:1px solid #d1d5db;border-radius:6px;">
-                </td>
                 <td style="${logTdStyle()}color:#64748b;" class="jxj-group-quota-left">
                   ${left === null
-                    ? '只受上一级约束'
-                    : `时段上限 ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(left))}</b> 元`}
+                    ? '只受店铺预算约束'
+                    : `${isSlotBudgetEnabled(settings) ? '当前时段' : '当天'} ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(left))}</b> 元`}
                 </td>
               </tr>
             `;
@@ -3415,6 +3528,7 @@
       [...document.querySelectorAll('.jxj-group-quota-row')].forEach(row => {
         const group = readGroupRowFromPanel(row);
         if (!group) return;
+        syncGroupQuotaValueInput(row, group.quotaMode);
         const daily = getGroupDailyQuota(group, settings);
         const slotQuota = getGroupSlotQuota(group, settings, slot);
         const used = slotQuota === null ? 0 : getGroupUsedAmount(group.id, { includePending: true });
@@ -3423,8 +3537,8 @@
         if (amountCell) amountCell.innerHTML = daily === null ? '<span style="color:#94a3b8;">不限</span>' : `${escapeHtml(formatMoney(daily))} 元`;
         if (leftCell) {
           leftCell.innerHTML = slotQuota === null
-            ? '只受上一级约束'
-            : `时段上限 ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(Math.max(0, slotQuota - used)))}</b> 元`;
+            ? '只受店铺预算约束'
+            : `${isSlotBudgetEnabled(settings) ? '当前时段' : '当天'} ${escapeHtml(formatMoney(slotQuota))} 元，已用 ${escapeHtml(formatMoney(used))} 元，还能充 <b>${escapeHtml(formatMoney(Math.max(0, slotQuota - used)))}</b> 元`;
         }
       });
     }
@@ -3446,9 +3560,25 @@
       return;
     }
 
-    box.innerHTML = total > budget
-      ? `<span style="color:#b45309;">各分组额度合计 ${escapeHtml(formatMoney(total))} 元，超过店铺当天预算 ${escapeHtml(formatMoney(budget))} 元。仍可保存，实际以上一级为硬上限，先到先用。</span>`
-      : `<span style="color:#15803d;">各分组额度合计 ${escapeHtml(formatMoney(total))} 元，未超过店铺当天预算 ${escapeHtml(formatMoney(budget))} 元。</span>`;
+    const diff = Math.round((total - budget) * 100) / 100;
+    if (Math.abs(diff) < 0.01) {
+      box.innerHTML = `<span style="color:#15803d;">各分组预算合计 ${escapeHtml(formatMoney(total))} 元，已对齐当天店铺预算 ${escapeHtml(formatMoney(budget))} 元。</span>`;
+    } else if (total > budget) {
+      box.innerHTML = `<span style="color:#b45309;">各分组预算合计 ${escapeHtml(formatMoney(total))} 元，比当天店铺预算 ${escapeHtml(formatMoney(budget))} 元多 ${escapeHtml(formatMoney(diff))} 元。仍可保存，实际充值不会超过店铺预算。</span>`;
+    } else {
+      box.innerHTML = `<span style="color:#b45309;">各分组预算合计 ${escapeHtml(formatMoney(total))} 元，比当天店铺预算 ${escapeHtml(formatMoney(budget))} 元少 ${escapeHtml(formatMoney(-diff))} 元。建议把差额分给某个分组，或留给「未分组」。</span>`;
+    }
+  }
+
+  function syncGroupQuotaValueInput(row, quotaMode) {
+    const valueEl = row && row.querySelector('[data-group-field="quotaValue"]');
+    if (!valueEl) return;
+    const mode = quotaMode || 'none';
+    const locked = mode === 'none';
+    valueEl.disabled = locked;
+    valueEl.placeholder = mode === 'percent' ? '%' : '填写金额';
+    valueEl.style.background = locked ? '#f8fafc' : '#fff';
+    if (locked && document.activeElement === valueEl) valueEl.blur();
   }
 
   function readGroupRowFromPanel(row) {
@@ -3466,9 +3596,9 @@
       id: groupId,
       name: saved.name,
       quotaMode: readValue('quotaMode') || saved.quotaMode,
-      quotaValue: readValue('quotaValue'),
-      amount: readValue('amount'),
-      minRoi: readValue('minRoi')
+      quotaValue: readValue('quotaValue') === '' ? saved.quotaValue : readValue('quotaValue'),
+      amount: row.querySelector('[data-group-field="amount"]') ? readValue('amount') : saved.amount,
+      minRoi: row.querySelector('[data-group-field="minRoi"]') ? readValue('minRoi') : saved.minRoi
     });
   }
 
@@ -3506,10 +3636,13 @@
     return `
       ${workspaceStepBarHtml('slots')}
       <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
-        第 2 步：把全店预算按时段切开。这是累计上限，到某个时段为止最多花多少，不是各段相加。
+        第 2 步：分时预算可以关闭。关闭后全店只按第 1 步的当天店铺预算跑；开启后才按下面的累计时段上限卡。
       </div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
-        <div style="font-weight:800;margin-bottom:6px;">分时累计上限</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+          <div style="font-weight:800;">分时累计上限</div>
+          <label style="font-size:13px;white-space:nowrap;"><input id="jxj-slot-enabled" type="checkbox" ${settings.slotBudgetEnabled !== false ? 'checked' : ''}> 开启分时预算</label>
+        </div>
         <div style="font-size:12px;color:#64748b;line-height:1.6;margin-bottom:10px;">
           这是<b>累计</b>上限，不是各时段相加。例如到 09:00-14:00 这一段，当天累计充值不超过当天预算的对应比例。
           当天预算 <b id="jxj-slot-daily-budget">${escapeHtml(formatMoney(getDailyBudgetAmount(settings)))}</b> 元，改动会实时换算金额。
@@ -3575,8 +3708,26 @@
     const budgetBox = panel.querySelector('#jxj-slot-daily-budget');
     if (budgetBox) budgetBox.innerText = formatMoney(getDailyBudgetAmount(getBudgetSettings()));
 
+    const slotEnabled = panel.querySelector('#jxj-slot-enabled');
+    if (slotEnabled && document.activeElement !== slotEnabled) {
+      slotEnabled.checked = isSlotBudgetEnabled(getBudgetSettings());
+    }
+
     const hint = panel.querySelector('#jxj-slot-hint');
     if (hint) hint.innerHTML = budgetSlotHintHtml(slots);
+  }
+
+  function syncBudgetModeFields(panel, mode) {
+    if (!panel) return;
+    const smart = mode !== 'fixed';
+    const smartBox = panel.querySelector('#jxj-budget-smart-fields');
+    const fixedBox = panel.querySelector('#jxj-budget-fixed-fields');
+    const smartRadio = panel.querySelector('#jxj-budget-mode-smart');
+    const fixedRadio = panel.querySelector('#jxj-budget-mode-fixed');
+    if (smartRadio) smartRadio.checked = smart;
+    if (fixedRadio) fixedRadio.checked = !smart;
+    if (smartBox) smartBox.style.display = smart ? 'grid' : 'none';
+    if (fixedBox) fixedBox.style.display = smart ? 'none' : 'grid';
   }
 
   function fillBudgetSettingsInputs(panel, settings) {
@@ -3586,12 +3737,17 @@
     const combinedFee = panel && panel.querySelector('#jxj-budget-combined-fee');
     const returnRate = panel && panel.querySelector('#jxj-budget-return-rate');
     const targetRoi = panel && panel.querySelector('#jxj-budget-target-roi');
+    const targetRoiFixed = panel && panel.querySelector('#jxj-budget-target-roi-fixed');
+    const fixedDaily = panel && panel.querySelector('#jxj-budget-fixed-daily');
 
     if (enabled) enabled.checked = item.enabled !== false;
     if (avgGmv && document.activeElement !== avgGmv) avgGmv.value = item.avgGmv7d ? String(item.avgGmv7d) : '';
     if (combinedFee && document.activeElement !== combinedFee) combinedFee.value = item.combinedFeePercent ? String(item.combinedFeePercent) : '';
     if (returnRate && document.activeElement !== returnRate) returnRate.value = item.returnRatePercent ? String(item.returnRatePercent) : '';
     if (targetRoi && document.activeElement !== targetRoi) targetRoi.value = String(item.targetShopRoi);
+    if (targetRoiFixed && document.activeElement !== targetRoiFixed) targetRoiFixed.value = String(item.targetShopRoi);
+    if (fixedDaily && document.activeElement !== fixedDaily) fixedDaily.value = item.fixedDailyBudget ? String(item.fixedDailyBudget) : '';
+    syncBudgetModeFields(panel, item.budgetMode);
 
     const summary = panel && panel.querySelector('#jxj-budget-slot-summary');
     if (summary) summary.innerHTML = budgetSlotSummaryHtml();
@@ -3599,15 +3755,23 @@
 
   function readBudgetSettingsFromPanel(panel) {
     if (!panel) return getBudgetSettings();
+    const saved = getBudgetSettings();
+    const fixedMode = !!(panel.querySelector('#jxj-budget-mode-fixed') && panel.querySelector('#jxj-budget-mode-fixed').checked);
+    const targetRoi = Number(
+      ((fixedMode ? panel.querySelector('#jxj-budget-target-roi-fixed') : panel.querySelector('#jxj-budget-target-roi')) || {}).value
+      || CONFIG.targetShopRoi
+    );
 
     return normalizeBudgetSettings({
       enabled: !!(panel.querySelector('#jxj-budget-enabled') && panel.querySelector('#jxj-budget-enabled').checked),
+      budgetMode: fixedMode ? 'fixed' : 'smart',
       avgGmv7d: Number((panel.querySelector('#jxj-budget-avg-gmv') || {}).value || 0),
       combinedFeePercent: Number((panel.querySelector('#jxj-budget-combined-fee') || {}).value || 0),
       returnRatePercent: Number((panel.querySelector('#jxj-budget-return-rate') || {}).value || 0),
-      targetShopRoi: Number((panel.querySelector('#jxj-budget-target-roi') || {}).value || CONFIG.targetShopRoi),
-      // 分时上限只由「店铺分时规则」页的保存按钮写入，避免在预算页误存未确认的改动。
-      budgetSlots: getBudgetSettings().budgetSlots
+      fixedDailyBudget: Number((panel.querySelector('#jxj-budget-fixed-daily') || {}).value || 0),
+      targetShopRoi: targetRoi,
+      slotBudgetEnabled: saved.slotBudgetEnabled,
+      budgetSlots: saved.budgetSlots
     });
   }
 
@@ -3969,7 +4133,7 @@
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;white-space:nowrap;">${escapeHtml([item.queueStatus, getTaskRetryText(item)].filter(Boolean).join(' / '))}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(item.accountName)}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;text-align:right;">${escapeHtml(item.amount)}</td>
-              <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(item.ruleName || '默认')} / ${escapeHtml(item.triggerReason || '余额/ROI规则')}</td>
+              <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(item.ruleName || '默认')} / ${escapeHtml(item.triggerReason || '智能充值')}</td>
             </tr>
           `).join('')}
         </tbody>
@@ -4084,7 +4248,11 @@
   function getRuleConflictMessages(rules) {
     const enabledRules = (rules || getRules())
       .map(normalizeRule)
-      .filter(rule => rule.enabled && (rule.matchType === 'all' || normalizeText(rule.accountPattern)));
+      .filter(rule => rule.enabled && (
+        rule.matchType === 'all' ||
+        (rule.matchType === 'group' && rule.groupId) ||
+        normalizeText(rule.accountPattern)
+      ));
 
     const messages = [];
     const groups = new Map();
@@ -4092,7 +4260,9 @@
     for (const rule of enabledRules) {
       const key = rule.matchType === 'all'
         ? 'all|__shop_children__'
-        : `${rule.matchType}|${normalizeText(rule.accountPattern)}`;
+        : rule.matchType === 'group'
+          ? `group|${rule.groupId}`
+          : `${rule.matchType}|${normalizeText(rule.accountPattern)}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(rule);
     }
@@ -4102,10 +4272,15 @@
 
       const first = group[0];
       const typeText = first.matchType === 'all' ? '全店规则'
-        : first.matchType === 'exact' ? '分账号·精确'
-          : first.matchType === 'prefix' ? '分账号·前缀'
-            : '分账号·包含';
-      const patternText = first.matchType === 'all' ? (getShopName() || '未设置店铺') : first.accountPattern;
+        : first.matchType === 'group' ? '分组规则'
+          : first.matchType === 'exact' ? '账号规则·精确'
+            : first.matchType === 'prefix' ? '账号规则·前缀'
+              : '账号规则·包含';
+      const patternText = first.matchType === 'all'
+        ? (getShopName() || '未设置店铺')
+        : first.matchType === 'group'
+          ? ((getAccountGroup(first.groupId) || {}).name || '未选择分组')
+          : first.accountPattern;
       messages.push(`${typeText}匹配「${patternText}」存在 ${group.length} 条启用规则，建议只保留一条`);
     });
 
@@ -4116,7 +4291,7 @@
     const messages = getRuleConflictMessages(rules);
 
     if (!messages.length) {
-      return '<div style="padding:8px;color:#389e0d;background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;font-size:12px;">未发现重复启用规则。同一个子账号只会用一条规则：分账号精确 &gt; 前缀 &gt; 包含 &gt; 全店规则。</div>';
+      return '<div style="padding:8px;color:#389e0d;background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;font-size:12px;">未发现重复启用规则。同一个子账号只会用一条规则：账号精确 &gt; 前缀 &gt; 包含 &gt; 分组规则 &gt; 全店规则。</div>';
     }
 
     return `
@@ -4196,8 +4371,19 @@
         badgeBg: '#ecfeff',
         badgeColor: '#0f766e',
         border: '#14b8a6',
-        hint: '覆盖本店所有子账号，不用填账号名。某个账号如果另有分账号规则，则以分账号规则为准。',
+        hint: '覆盖本店所有子账号。某个账号如果另有分组规则或账号规则，则以更细的那条为准。',
         placeholder: '全店规则不用填账号'
+      };
+    }
+
+    if (matchType === 'group') {
+      return {
+        badge: '分组规则',
+        badgeBg: '#f5f3ff',
+        badgeColor: '#6d28d9',
+        border: '#7c3aed',
+        hint: '只对选中分组里的子账号生效。该组里如果某个号还有账号规则，以账号规则为准。',
+        placeholder: '请选择分组'
       };
     }
 
@@ -4240,10 +4426,12 @@
     const badge = row.querySelector('.jxj-rule-scope-badge');
     const hint = row.querySelector('.jxj-rule-scope-hint');
     const input = row.querySelector('[data-field="accountPattern"]');
+    const groupSelect = row.querySelector('[data-field="groupId"]');
     const label = row.querySelector('.jxj-rule-account-label');
     const shopWide = matchType === 'all';
+    const groupRule = matchType === 'group';
 
-    row.setAttribute('data-rule-scope', shopWide ? 'shop' : 'account');
+    row.setAttribute('data-rule-scope', shopWide ? 'shop' : (groupRule ? 'group' : 'account'));
     row.style.borderLeftColor = meta.border;
 
     if (badge) {
@@ -4252,50 +4440,66 @@
       badge.style.color = meta.badgeColor;
     }
     if (hint) hint.innerText = meta.hint;
-    if (label) label.innerText = shopWide ? '适用账号' : '指定账号';
+    if (label) label.innerText = shopWide ? '适用账号' : (groupRule ? '适用分组' : '指定账号');
     if (input) {
-      input.disabled = shopWide;
+      input.style.display = groupRule ? 'none' : 'block';
+      input.disabled = shopWide || groupRule;
       input.placeholder = meta.placeholder;
-      input.style.background = shopWide ? '#f8fafc' : '#fff';
+      input.style.background = shopWide || groupRule ? '#f8fafc' : '#fff';
+    }
+    if (groupSelect) {
+      groupSelect.style.display = groupRule ? 'block' : 'none';
+      groupSelect.disabled = !groupRule;
     }
   }
 
   function ruleScopeGuideHtml() {
     return `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
         <div style="border:1px solid #99f6e4;background:#f0fdfa;border-radius:10px;padding:10px 12px;">
-          <div style="font-weight:800;color:#0f766e;">全店规则</div>
-          <div style="font-size:12px;color:#334155;line-height:1.55;margin-top:4px;">规则类型选「全店规则」，账号留空。一条就能管本店所有子账号。适合统一余额、ROI、分时充值。</div>
+          <div style="font-weight:800;color:#0f766e;">1. 全店规则</div>
+          <div style="font-size:12px;color:#334155;line-height:1.55;margin-top:4px;">本店所有子账号通用。没有分组规则、账号规则时走这条。</div>
+        </div>
+        <div style="border:1px solid #ddd6fe;background:#f5f3ff;border-radius:10px;padding:10px 12px;">
+          <div style="font-weight:800;color:#6d28d9;">2. 分组规则</div>
+          <div style="font-size:12px;color:#334155;line-height:1.55;margin-top:4px;">选一个分组，这个组里的账号共用余额、ROI、一次金额。该组里有账号规则的除外。</div>
         </div>
         <div style="border:1px solid #bfdbfe;background:#eff6ff;border-radius:10px;padding:10px 12px;">
-          <div style="font-weight:800;color:#1d4ed8;">分账号规则</div>
-          <div style="font-size:12px;color:#334155;line-height:1.55;margin-top:4px;">规则类型选「分账号」，并填写子账号。只改个别账号时用这个。优先级：精确 &gt; 前缀 &gt; 包含 &gt; 全店。</div>
+          <div style="font-weight:800;color:#1d4ed8;">3. 账号规则</div>
+          <div style="font-size:12px;color:#334155;line-height:1.55;margin-top:4px;">只对这一个子账号生效，优先级最高。精确 &gt; 前缀 &gt; 包含。</div>
         </div>
       </div>
     `;
+  }
+
+  function groupSelectOptionsHtml(selectedId) {
+    return getAccountGroups().map(group =>
+      `<option value="${escapeHtml(group.id)}" ${group.id === selectedId ? 'selected' : ''}>${escapeHtml(group.name)}</option>`
+    ).join('');
   }
 
   function ruleRowHtml(rule, index, total) {
     const item = normalizeRule(rule);
     const meta = ruleScopeMeta(item.matchType);
     const shopWide = isShopWideRule(item);
+    const groupRule = item.matchType === 'group';
 
     return `
-      <div class="jxj-rule-row" data-rule-id="${escapeHtml(item.id)}" data-index="${index}" data-rule-scope="${shopWide ? 'shop' : 'account'}" style="border:1px solid #cbd5e1;border-left:4px solid ${item.enabled ? meta.border : '#cbd5e1'};border-radius:7px;padding:11px 12px;margin:12px 0;background:#fff;box-shadow:0 2px 6px rgba(15,23,42,.07);">
+      <div class="jxj-rule-row" data-rule-id="${escapeHtml(item.id)}" data-index="${index}" data-rule-scope="${shopWide ? 'shop' : (groupRule ? 'group' : 'account')}" style="border:1px solid #cbd5e1;border-left:4px solid ${item.enabled ? meta.border : '#cbd5e1'};border-radius:7px;padding:11px 12px;margin:12px 0;background:#fff;box-shadow:0 2px 6px rgba(15,23,42,.07);">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
           <span class="jxj-rule-scope-badge" style="display:inline-block;padding:3px 10px;border-radius:999px;background:${meta.badgeBg};color:${meta.badgeColor};font-size:12px;font-weight:800;">${escapeHtml(meta.badge)}</span>
           <div class="jxj-rule-scope-hint" style="flex:1;min-width:220px;font-size:12px;color:#64748b;line-height:1.45;">${escapeHtml(meta.hint)}</div>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
-          <div style="display:grid;grid-template-columns:70px 64px minmax(140px,1fr) 148px 88px;gap:8px;align-items:center;flex:1;min-width:0;">
+          <div style="display:grid;grid-template-columns:70px 64px 168px 88px;gap:8px;align-items:center;flex:1;min-width:0;">
             <label style="font-size:12px;color:#4b5563;white-space:nowrap;">移到<input data-field="moveToIndex" type="number" min="1" step="1" value="${index + 1}" style="width:42px;margin-left:4px;padding:5px;border:1px solid #d1d5db;border-radius:4px;"></label>
             <label style="font-size:13px;white-space:nowrap;"><input type="checkbox" data-field="enabled" ${item.enabled ? 'checked' : ''}> 启用</label>
-            <input data-field="name" value="${escapeHtml(item.name)}" placeholder="规则名称，仅用于识别" style="height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;">
-            <select data-field="matchType" title="全店规则覆盖所有子账号；分账号规则只作用于填写的账号" style="height:32px;padding:5px 8px;border:1px solid #d1d5db;border-radius:4px;background:#fff;">
+            <select data-field="matchType" title="全店、分组、账号三级规则，同一个号只走最细的一条" style="height:32px;padding:5px 8px;border:1px solid #d1d5db;border-radius:4px;background:#fff;">
             <option value="all" ${item.matchType === 'all' ? 'selected' : ''}>全店规则</option>
-            <option value="exact" ${item.matchType === 'exact' ? 'selected' : ''}>分账号 · 精确</option>
-            <option value="prefix" ${item.matchType === 'prefix' ? 'selected' : ''}>分账号 · 前缀</option>
-            <option value="contains" ${item.matchType === 'contains' ? 'selected' : ''}>分账号 · 包含</option>
+            <option value="group" ${item.matchType === 'group' ? 'selected' : ''}>分组规则</option>
+            <option value="exact" ${item.matchType === 'exact' ? 'selected' : ''}>账号规则 · 精确</option>
+            <option value="prefix" ${item.matchType === 'prefix' ? 'selected' : ''}>账号规则 · 前缀</option>
+            <option value="contains" ${item.matchType === 'contains' ? 'selected' : ''}>账号规则 · 包含</option>
             </select>
             <label style="font-size:12px;color:#4b5563;white-space:nowrap;">金额<input data-field="amount" type="number" min="1" step="1" value="${escapeHtml(item.amount)}" title="未开启分时充值时的一次充值金额" style="width:54px;margin-left:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;"></label>
           </div>
@@ -4307,21 +4511,24 @@
           </div>
         </div>
         <div class="jxj-rule-account-wrap" style="display:grid;grid-template-columns:88px 1fr;gap:8px;align-items:center;margin-top:8px;">
-          <div class="jxj-rule-account-label" style="font-size:12px;color:#6b7280;">${shopWide ? '适用账号' : '指定账号'}</div>
-          <input data-field="accountPattern" value="${escapeHtml(item.accountPattern)}" ${shopWide ? 'disabled' : ''} placeholder="${escapeHtml(meta.placeholder)}" style="width:100%;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;background:${shopWide ? '#f8fafc' : '#fff'};">
+          <div class="jxj-rule-account-label" style="font-size:12px;color:#6b7280;">${shopWide ? '适用账号' : (groupRule ? '适用分组' : '指定账号')}</div>
+          <input data-field="accountPattern" value="${escapeHtml(item.accountPattern)}" ${shopWide || groupRule ? 'disabled' : ''} placeholder="${escapeHtml(meta.placeholder)}" style="width:100%;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;background:${shopWide || groupRule ? '#f8fafc' : '#fff'};display:${groupRule ? 'none' : 'block'};">
+          <select data-field="groupId" ${groupRule ? '' : 'disabled'} style="width:100%;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;background:#fff;display:${groupRule ? 'block' : 'none'};">
+            ${groupSelectOptionsHtml(item.groupId)}
+          </select>
         </div>
-        <div style="display:grid;grid-template-columns:86px 96px 96px 100px minmax(160px,1fr) 82px;gap:8px;align-items:center;margin-top:8px;font-size:13px;">
-          <label style="white-space:nowrap;"><input type="checkbox" data-field="useThreshold" ${item.useThreshold ? 'checked' : ''}> 自动条件</label>
+        <div style="display:grid;grid-template-columns:96px 96px 96px 100px minmax(160px,1fr) 82px;gap:8px;align-items:center;margin-top:8px;font-size:13px;">
+          <label style="white-space:nowrap;"><input type="checkbox" data-field="useThreshold" ${item.useThreshold ? 'checked' : ''}> 智能充值</label>
           <label style="white-space:nowrap;">余额&lt;<input data-field="minBalance" type="number" min="0" step="1" value="${escapeHtml(item.minBalance)}" style="width:54px;margin-left:4px;padding:5px;border:1px solid #d1d5db;border-radius:4px;"></label>
           <label style="white-space:nowrap;">ROI&gt;<input data-field="minRoi" type="number" min="0" step="0.1" value="${escapeHtml(item.minRoi)}" style="width:54px;margin-left:4px;padding:5px;border:1px solid #d1d5db;border-radius:4px;"></label>
-          <label style="white-space:nowrap;"><input type="checkbox" data-field="useSchedule" ${item.useSchedule ? 'checked' : ''}> 固定时间</label>
+          <label style="white-space:nowrap;"><input type="checkbox" data-field="useSchedule" ${item.useSchedule ? 'checked' : ''}> 定时充值</label>
           <input data-field="scheduleTimes" value="${escapeHtml(item.scheduleTimes)}" placeholder="10:58=100, 14:30=200" style="height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;">
           <input data-field="scheduleWindowMinutes" type="hidden" value="1">
           <label style="white-space:nowrap;">冷却<input data-field="cooldownMinutes" type="number" min="0" step="1" value="${escapeHtml(item.cooldownMinutes)}" style="width:44px;margin-left:4px;padding:5px;border:1px solid #d1d5db;border-radius:4px;">分</label>
         </div>
         <div style="margin-top:8px;padding:8px 10px;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:6px;">
           <label style="font-size:13px;white-space:nowrap;"><input type="checkbox" data-field="useTimeSlots" ${item.useTimeSlots ? 'checked' : ''}> 分时充值规则</label>
-          <div style="font-size:12px;color:#6b7280;line-height:1.45;margin:4px 0 6px;">开启后，自动条件按当前时段的一次充值金额和 ROI 判断；未开启时仍用上面的金额和 ROI。</div>
+          <div style="font-size:12px;color:#6b7280;line-height:1.45;margin:4px 0 6px;">开启后，智能充值按当前时段的一次金额和投产判断；未开启时仍用上面的金额和投产。</div>
           ${normalizeRuleTimeSlots(item.timeSlots, item.amount, item.minRoi).map((slot, slotIndex) => `
             <div class="jxj-rule-timeslot" data-slot-index="${slotIndex}" style="display:grid;grid-template-columns:58px 18px 58px 108px 110px;gap:8px;align-items:center;margin-top:6px;font-size:12px;color:#4b5563;">
               <label style="white-space:nowrap;"><input data-slot-field="startHour" type="number" min="0" max="24" step="1" value="${escapeHtml(slot.startHour)}" style="width:42px;margin-right:2px;padding:5px;border:1px solid #d1d5db;border-radius:4px;">点</label>
@@ -4340,8 +4547,8 @@
     return [...panel.querySelectorAll('.jxj-rule-row')].map(row => ({
       id: row.getAttribute('data-rule-id') || makeRuleId(),
       enabled: row.querySelector('[data-field="enabled"]').checked,
-      name: row.querySelector('[data-field="name"]').value.trim() || '未命名规则',
       matchType: row.querySelector('[data-field="matchType"]').value,
+      groupId: ((row.querySelector('[data-field="groupId"]') || {}).value || ''),
       accountPattern: row.querySelector('[data-field="accountPattern"]').value.trim(),
       amount: Number(row.querySelector('[data-field="amount"]').value || CONFIG.rechargeAmount),
       useThreshold: row.querySelector('[data-field="useThreshold"]').checked,
@@ -4362,7 +4569,10 @@
   }
 
   function isSavableRule(rule) {
-    return !!rule && (rule.matchType === 'all' || !!String(rule.accountPattern || '').trim());
+    if (!rule) return false;
+    if (rule.matchType === 'all') return true;
+    if (rule.matchType === 'group') return !!String(rule.groupId || '').trim();
+    return !!String(rule.accountPattern || '').trim();
   }
 
   function moveRuleToPanel(panel, index, targetIndex) {
@@ -4438,9 +4648,10 @@
         type: 'select',
         options: [
           { value: 'all', label: '全店规则' },
-          { value: 'exact', label: '分账号 · 精确' },
-          { value: 'prefix', label: '分账号 · 前缀' },
-          { value: 'contains', label: '分账号 · 包含' }
+          { value: 'group', label: '分组规则' },
+          { value: 'exact', label: '账号规则 · 精确' },
+          { value: 'prefix', label: '账号规则 · 前缀' },
+          { value: 'contains', label: '账号规则 · 包含' }
         ]
       },
       {
@@ -4454,7 +4665,7 @@
       },
       {
         field: 'useThreshold',
-        label: '自动条件',
+        label: '智能充值',
         type: 'boolean',
         trueText: '开启',
         falseText: '关闭'
@@ -4477,14 +4688,14 @@
       },
       {
         field: 'useSchedule',
-        label: '固定时间开关',
+        label: '定时充值开关',
         type: 'boolean',
         trueText: '开启',
         falseText: '关闭'
       },
       {
         field: 'scheduleTimes',
-        label: '固定时间内容',
+        label: '定时充值内容',
         type: 'text',
         placeholder: '10:58=100, 14:30=200'
       },
@@ -4759,7 +4970,7 @@
           tasks.push(buildDirectRuleTask(
             rule,
             plan.amount,
-            `固定时间 ${plan.text}`,
+            `定时充值 ${plan.text}`,
             doneKey
           ));
         }
@@ -4784,9 +4995,9 @@
         if (!noticeMap[noticeKey]) {
           noticeMap[noticeKey] = Date.now();
           writeJsonValue(STORAGE_DRY_RUN_SCHEDULE_NOTICE, noticeMap);
-          setSimulationResults(pendingTasks, '固定时间模拟', budgeted);
+          setSimulationResults(pendingTasks, '定时充值模拟', budgeted);
           showStatus(
-            `模拟运行：固定时间到点，原本会投递 ${tasks.length} 个，预算后 ${pendingTasks.length} 个充值任务：\n` +
+            `模拟运行：定时充值到点，原本会投递 ${tasks.length} 个，预算后 ${pendingTasks.length} 个充值任务：\n` +
             pendingTasks.map(task => `${task.accountName}，${task.amount}元`).join('\n') +
             skippedText +
             budgetText
@@ -4797,7 +5008,7 @@
       }
 
       if (!pendingTasks.length) {
-        showStatus('固定时间到点，但受当日推广预算限制，未投递充值任务' + skippedText + budgetText);
+        showStatus('定时充值到点，但受当日推广预算限制，未投递充值任务' + skippedText + budgetText);
         return;
       }
 
@@ -4808,7 +5019,7 @@
       const added = addTasks(pendingTasks).added;
 
       showStatus(
-        `固定时间到点，已投递 ${added}/${pendingTasks.length} 个充值任务：\n` +
+        `定时充值到点，已投递 ${added}/${pendingTasks.length} 个充值任务：\n` +
         pendingTasks.map(task => `${task.accountName}，${task.amount}元`).join('\n') +
         skippedText +
         budgetText
@@ -4838,7 +5049,7 @@
     { id: 'budget', label: '① 店铺预算', step: 1 },
     { id: 'slots', label: '② 分时预算', step: 2 },
     { id: 'accounts', label: '③ 子账号与分组', step: 3 },
-    { id: 'alloc', label: '④ 分组与账号额度', step: 4 },
+    { id: 'alloc', label: '④ 分组与账号预算', step: 4 },
     { id: 'rules', label: '⑤ 充值规则', step: 5 },
     { id: 'queue', label: '充值队列' },
     { id: 'logs', label: '提交记录' },
@@ -5069,7 +5280,7 @@
     const roster = getAccountRoster();
 
     if (!roster.length) {
-      return '<div style="font-size:12px;color:#64748b;line-height:1.6;">还没有子账号名单。到「③ 子账号与分组」点「从页面拉取子账号」，就能按分组分配额度。</div>';
+      return '<div style="font-size:12px;color:#64748b;line-height:1.6;">还没有子账号名单。到「③ 子账号与分组」点「从页面拉取子账号」，就能按分组分配预算。</div>';
     }
 
     return `
@@ -5078,9 +5289,9 @@
           <tr style="background:#f8fafc;color:#475569;">
             <th style="text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;">分组</th>
             <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">账号数</th>
-            <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">当天额度</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">当天预算</th>
             <th style="text-align:right;padding:8px;border-bottom:1px solid #e2e8f0;">已用</th>
-            <th style="text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;">当前时段还能充</th>
+            <th style="text-align:left;padding:8px;border-bottom:1px solid #e2e8f0;">还能充</th>
           </tr>
         </thead>
         <tbody>
@@ -5097,7 +5308,7 @@
                 <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${escapeHtml(count)}</td>
                 <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${daily === null ? '不限' : `${escapeHtml(formatMoney(daily))} 元`}</td>
                 <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;">${escapeHtml(formatMoney(used))} 元</td>
-                <td style="padding:8px;border-bottom:1px solid #eef2f7;color:#334155;">${left === null ? '只受店铺和分时约束' : `${escapeHtml(formatMoney(left))} 元`}</td>
+                <td style="padding:8px;border-bottom:1px solid #eef2f7;color:#334155;">${left === null ? '只受店铺预算约束' : `${escapeHtml(formatMoney(left))} 元`}</td>
               </tr>
             `;
           }).join('')}
@@ -5132,8 +5343,8 @@
       <div style="display:grid;grid-template-columns:minmax(0,1fr) 170px;gap:12px;margin-bottom:12px;">
         <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;">
           <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px;">
-            <div style="font-weight:800;color:#0f172a;">分时预算进度</div>
-            <div style="font-size:12px;color:#64748b;">当前上限 ${escapeHtml(formatMoney(decision.slotBudget))} 元，已用 ${escapeHtml(formatMoney(decision.used))} 元</div>
+            <div style="font-weight:800;color:#0f172a;">${decision.slotEnabled ? '分时预算进度' : '店铺预算进度'}</div>
+            <div style="font-size:12px;color:#64748b;">${decision.slotEnabled ? `当前上限 ${escapeHtml(formatMoney(decision.slotBudget))} 元` : '分时已关闭，按当天店铺预算'}，已用 ${escapeHtml(formatMoney(decision.used))} 元</div>
           </div>
           ${budgetProgressHtml(decision)}
         </div>
@@ -5147,7 +5358,7 @@
         ${overviewSlotTableHtml(decision)}
       </div>
       <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px;margin-bottom:12px;">
-        <div style="font-weight:800;color:#0f172a;margin-bottom:8px;">分组额度进度</div>
+        <div style="font-weight:800;color:#0f172a;margin-bottom:8px;">分组预算进度</div>
         ${overviewGroupTableHtml(decision)}
       </div>
       <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:10px 12px;font-size:13px;color:#1e3a8a;line-height:1.5;">
@@ -5238,13 +5449,14 @@
   }
 
   function addBlankRuleToPanel(panel, matchType) {
-    const shopWide = matchType === 'all';
+    const type = matchType === 'all' || matchType === 'group' ? matchType : 'exact';
+    const groups = getAccountGroups();
     const rules = readRulesFromPanel(panel);
     rules.push(normalizeRule({
       id: makeRuleId(),
       enabled: true,
-      name: shopWide ? '全店规则' : '分账号规则',
-      matchType: shopWide ? 'all' : 'exact',
+      matchType: type,
+      groupId: type === 'group' ? (groups[0] && groups[0].id) || UNGROUPED_ID : '',
       accountPattern: '',
       amount: CONFIG.rechargeAmount,
       useThreshold: true,
@@ -5260,7 +5472,11 @@
     refreshRulePanelRows(panel, rules);
     refreshRuleConflictPanel(rules);
     refreshNextRunPanel();
-    showStatus(shopWide ? '已新增一条全店规则，保存后对本店所有子账号生效' : '已新增一条分账号规则，请填写完整子账号名称后保存');
+    showStatus(
+      type === 'all' ? '已新增一条全店规则，保存后对本店所有子账号生效'
+        : type === 'group' ? '已新增一条分组规则，请选择分组后保存'
+          : '已新增一条账号规则，请填写完整子账号名称后保存'
+    );
   }
 
   function handleWorkspaceAction(panel, action, actionEl) {
@@ -5385,12 +5601,12 @@
         return;
       }
 
-      groups.push(normalizeAccountGroup({ id: makeLogId(), name, quotaMode: 'none', quotaValue: 0 }));
+      groups.push(normalizeAccountGroup({ id: makeLogId(), name, quotaMode: 'fixed', quotaValue: 0 }));
       saveAccountGroups(groups);
       if (input) input.value = '';
       refreshAccountRosterPanel();
       refreshAllocationPanel({ rerender: true });
-      showStatus(`已新增分组「${name}」。到第 4 步可以给它设额度。`);
+      showStatus(`已新增分组「${name}」。到第 4 步可以给它填写当天预算。`);
       return;
     }
 
@@ -5442,9 +5658,9 @@
       refreshOverviewDashboard();
 
       const overText = budget > 0 && total > budget
-        ? `\n提醒：各分组额度合计 ${formatMoney(total)} 元，超过店铺当天预算 ${formatMoney(budget)} 元。已保存，实际以上一级为硬上限、先到先用。`
+        ? `\n提醒：各分组预算合计 ${formatMoney(total)} 元，超过店铺当天预算 ${formatMoney(budget)} 元。已保存，实际以上一级为硬上限、先到先用。`
         : '';
-      showStatus(`已保存分组额度和账号额度设置。${overText}`);
+      showStatus(`已保存分组预算和账号预算设置。${overText}`);
       return;
     }
     if (action === 'goto-queue') return switchWorkspacePage('queue');
@@ -5515,12 +5731,15 @@
         return;
       }
 
-      saveBudgetSettings(Object.assign({}, getBudgetSettings(), { budgetSlots: slots }));
+      const slotBudgetEnabled = !!(panel.querySelector('#jxj-slot-enabled') && panel.querySelector('#jxj-slot-enabled').checked);
+      saveBudgetSettings(Object.assign({}, getBudgetSettings(), { budgetSlots: slots, slotBudgetEnabled }));
       refreshBudgetSlotPage({ rerender: true });
       refreshOverviewDashboard();
       showStatus(
-        `已保存 ${slots.length} 个分时上限：\n` +
-        slots.map(slot => `${formatSlotRange(slot)} ${formatRatio(slot.percent)}% / ${formatMoney(getSlotBudgetAmount(getBudgetSettings(), slot))} 元`).join('\n')
+        slotBudgetEnabled
+          ? `已保存并开启分时预算，共 ${slots.length} 个时段：\n` +
+            slots.map(slot => `${formatSlotRange(slot)} ${formatRatio(slot.percent)}% / ${formatMoney(getSlotBudgetAmount(getBudgetSettings(), slot))} 元`).join('\n')
+          : `已关闭分时预算。全店按当天店铺预算 ${formatMoney(getDailyBudgetAmount(getBudgetSettings()))} 元跑。时段表仍保留，下次开启继续用。`
       );
       return;
     }
@@ -5534,7 +5753,9 @@
       showStatus(
         settings.enabled === false
           ? '已关闭店铺当天预算控制'
-          : `已保存店铺当天预算：近七天平均业绩 ${formatMoney(settings.avgGmv7d)} 元，合计费比 ${formatRatio(settings.combinedFeePercent)}%，退货率 ${formatRatio(settings.returnRatePercent)}%，当天预算 ${formatMoney(getDailyBudgetAmount(settings))} 元；当前时段 ${formatSlotRange(getCurrentBudgetSlot(settings))} 上限 ${formatMoney(getSlotBudgetAmount(settings, getCurrentBudgetSlot(settings)))} 元`
+          : (isFixedBudgetMode(settings)
+            ? `已保存固定店铺预算：当天 ${formatMoney(getDailyBudgetAmount(settings))} 元`
+            : `已保存智能店铺预算：近七天平均业绩 ${formatMoney(settings.avgGmv7d)} 元，合计费比 ${formatRatio(settings.combinedFeePercent)}%，退货率 ${formatRatio(settings.returnRatePercent)}%，当天预算 ${formatMoney(getDailyBudgetAmount(settings))} 元`)
       );
       return;
     }
@@ -5550,8 +5771,8 @@
     }
     if (action === 'test-dingtalk') return sendDingTalkTestMessage();
     if (action === 'capture-shop-name') return captureShopNameFromPage();
-    if (action === 'add-rule' || action === 'add-account-rule' || action === 'add-shop-rule') {
-      addBlankRuleToPanel(panel, action === 'add-shop-rule' ? 'all' : 'exact');
+    if (action === 'add-rule' || action === 'add-account-rule' || action === 'add-shop-rule' || action === 'add-group-rule') {
+      addBlankRuleToPanel(panel, action === 'add-shop-rule' ? 'all' : (action === 'add-group-rule' ? 'group' : 'exact'));
       return;
     }
     if (action === 'save-rules') {
@@ -5688,7 +5909,7 @@
                 <button type="button" data-action="manual-full-flow" style="padding:8px 12px;border:0;background:#16a34a;color:#fff;border-radius:6px;cursor:pointer;font-weight:700;">立即执行</button>
                 <button type="button" data-action="goto-budget" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">从第 1 步开始设置</button>
                 <button type="button" data-action="goto-accounts" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">子账号与分组</button>
-                <button type="button" data-action="goto-alloc" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">分组与账号额度</button>
+                <button type="button" data-action="goto-alloc" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">分组与账号预算</button>
                 <button type="button" data-action="goto-rules" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">去改规则</button>
                 <button type="button" data-action="goto-logs" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">查看记录</button>
                 <button type="button" data-action="goto-versions" style="padding:8px 12px;border:1px solid #cbd5e1;background:#fff;border-radius:6px;cursor:pointer;">版本中心</button>
@@ -5697,17 +5918,21 @@
             <div data-workspace-page="budget" style="display:none;">
               ${workspaceStepBarHtml('budget')}
               <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
-                第 1 步：先定全店当天能花多少。这是最高一级上限，后面的分时、分组、账号都不能超过它。
+                第 1 步：先定全店当天能花多少。智能预算和固定预算只能选一个。这是最高一级上限，后面的分时、分组、账号都不能超过它。
               </div>
               <div style="border:1px solid #e2e8f0;border-radius:12px;background:#fff;padding:14px;">
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
                   <div>
                     <div style="font-weight:800;color:#0f172a;">店铺当天推广预算</div>
-                    <div style="font-size:12px;color:#64748b;line-height:1.45;margin-top:2px;">推广费比 = 合计费比 − 店铺退货率；当天预算 = 近七天平均业绩 × 推广费比。无脚本充值记录时，已用金额按页面已消耗起算，可充金额 = 当前上限 − 已消耗。店铺投产达标后允许超过预算。</div>
+                    <div style="font-size:12px;color:#64748b;line-height:1.45;margin-top:2px;">两种策略二选一。智能：当天预算 = 近七天平均业绩 ×（合计费比 − 退货率）。固定：你手写当天金额。店铺投产达标后允许超过预算。</div>
                   </div>
                   <label style="font-size:13px;white-space:nowrap;"><input id="jxj-budget-enabled" type="checkbox"> 启用预算控制</label>
                 </div>
-                <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-items:end;">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+                  <label style="display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-size:13px;cursor:pointer;"><input type="radio" name="jxj-budget-mode" id="jxj-budget-mode-smart" value="smart"> 智能店铺预算</label>
+                  <label style="display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;font-size:13px;cursor:pointer;"><input type="radio" name="jxj-budget-mode" id="jxj-budget-mode-fixed" value="fixed"> 固定店铺预算</label>
+                </div>
+                <div id="jxj-budget-smart-fields" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-items:end;">
                   <label style="font-size:12px;color:#475569;">近七天平均业绩
                     <input id="jxj-budget-avg-gmv" type="number" min="0" step="1" placeholder="例如 10000" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;">
                   </label>
@@ -5719,6 +5944,14 @@
                   </label>
                   <label style="font-size:12px;color:#475569;">店铺投产达标值
                     <input id="jxj-budget-target-roi" type="number" min="0" step="0.1" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;">
+                  </label>
+                </div>
+                <div id="jxj-budget-fixed-fields" style="display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end;">
+                  <label style="font-size:12px;color:#475569;">当天固定预算（元）
+                    <input id="jxj-budget-fixed-daily" type="number" min="0" step="1" placeholder="例如 5200" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;">
+                  </label>
+                  <label style="font-size:12px;color:#475569;">店铺投产达标值
+                    <input id="jxj-budget-target-roi-fixed" type="number" min="0" step="0.1" style="width:100%;margin-top:4px;height:32px;box-sizing:border-box;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;">
                   </label>
                 </div>
                 <div id="jxj-budget-slot-summary">${budgetSlotSummaryHtml()}</div>
@@ -5741,13 +5974,13 @@
             <div data-workspace-page="rules" style="display:none;">
               ${workspaceStepBarHtml('rules')}
               <div style="background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.6;margin-bottom:10px;">
-                第 5 步：设置什么时候充、充多少。条件从小到大找：账号单独设置 &gt; 所在分组 &gt; 这里的全店规则。分组和账号的设置在第 4 步。
+                第 5 步：设置什么时候充、一次充多少。同一个号只走最细的一条：账号规则 &gt; 分组规则 &gt; 全店规则。
               </div>
               ${ruleScopeGuideHtml()}
               ${bulkRuleControlHtml()}
               <div id="jxj-rule-conflicts" style="margin-bottom:8px;"></div>
               <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:7px 10px;margin-bottom:8px;font-size:12px;color:#64748b;line-height:1.45;">
-                看每条规则顶部的绿色「全店规则」或蓝色「分账号规则」标签即可区分。改完后请点“保存规则”。勾选分时充值后，按当前时段的一次金额和 ROI 判断。
+                看每条规则顶部的标签区分全店 / 分组 / 账号。改完后请点“保存规则”。「智能充值」是余额低、投产够就补；「定时充值」是到点再充。勾选「分时充值」后，智能充值按时段用不同金额和投产，这和上面的店铺分时预算不是一回事。
               </div>
               <div id="jxj-rule-panel-rows"></div>
             </div>
@@ -5838,7 +6071,8 @@
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
               <button type="button" data-action="add-shop-rule" style="padding:7px 10px;border:1px solid #0f766e;background:#fff;color:#0f766e;border-radius:4px;cursor:pointer;">新增全店规则</button>
-              <button type="button" data-action="add-account-rule" style="padding:7px 10px;border:1px solid #2563eb;background:#fff;color:#2563eb;border-radius:4px;cursor:pointer;">新增分账号规则</button>
+              <button type="button" data-action="add-group-rule" style="padding:7px 10px;border:1px solid #7c3aed;background:#fff;color:#6d28d9;border-radius:4px;cursor:pointer;">新增分组规则</button>
+              <button type="button" data-action="add-account-rule" style="padding:7px 10px;border:1px solid #2563eb;background:#fff;color:#2563eb;border-radius:4px;cursor:pointer;">新增账号规则</button>
               <button type="button" data-action="save-rules" style="padding:7px 14px;border:0;background:#2563eb;color:#fff;border-radius:4px;cursor:pointer;font-weight:700;">保存规则</button>
             </div>
           </div>
@@ -5948,15 +6182,38 @@
       showStatus('已保存钉钉关键词：' + dingTalkKeyword);
     });
 
-    ['jxj-budget-enabled', 'jxj-budget-avg-gmv', 'jxj-budget-combined-fee', 'jxj-budget-return-rate', 'jxj-budget-target-roi']
+    ['jxj-budget-enabled', 'jxj-budget-avg-gmv', 'jxj-budget-combined-fee', 'jxj-budget-return-rate', 'jxj-budget-target-roi', 'jxj-budget-target-roi-fixed', 'jxj-budget-fixed-daily', 'jxj-budget-mode-smart', 'jxj-budget-mode-fixed']
       .forEach(id => {
       const input = panel.querySelector('#' + id);
       if (!input) return;
       input.addEventListener('input', () => refreshBudgetPreview(panel));
-      input.addEventListener('change', () => refreshBudgetPreview(panel));
+      input.addEventListener('change', () => {
+        if (id === 'jxj-budget-mode-smart' || id === 'jxj-budget-mode-fixed') {
+          const nextMode = id === 'jxj-budget-mode-fixed' ? 'fixed' : 'smart';
+          const fromEl = panel.querySelector(nextMode === 'fixed' ? '#jxj-budget-target-roi' : '#jxj-budget-target-roi-fixed');
+          const toEl = panel.querySelector(nextMode === 'fixed' ? '#jxj-budget-target-roi-fixed' : '#jxj-budget-target-roi');
+          const fromRoi = Number((fromEl && fromEl.value) || 0);
+          const toRoi = Number((toEl && toEl.value) || 0);
+          if (fromRoi > 0 && !toRoi && toEl) toEl.value = String(fromRoi);
+          syncBudgetModeFields(panel, nextMode);
+        }
+        refreshBudgetPreview(panel);
+      });
     });
 
     panel.addEventListener('change', event => {
+      if (event.target.closest('.jxj-group-quota-row')) {
+        refreshAllocationPanel();
+        return;
+      }
+      if (event.target.id === 'jxj-slot-enabled') {
+        saveBudgetSettings(Object.assign({}, getBudgetSettings(), { slotBudgetEnabled: !!event.target.checked }));
+        refreshBudgetSlotPage();
+        refreshAllocationPanel();
+        refreshOverviewDashboard();
+        showStatus(event.target.checked ? '已开启分时预算' : '已关闭分时预算，全店按当天店铺预算跑');
+        return;
+      }
       if (event.target.id !== 'jxj-roster-check-all') return;
       panel.querySelectorAll('.jxj-roster-check').forEach(box => { box.checked = event.target.checked; });
     });
@@ -7033,7 +7290,7 @@
 
       const { accountName, amount } = current;
 
-      showStatus(`正在自动充值：${accountName}，${amount}元\n规则：${current.ruleName || '默认'}\n原因：${current.triggerReason || '余额/ROI规则'}`);
+      showStatus(`正在自动充值：${accountName}，${amount}元\n规则：${current.ruleName || '默认'}\n原因：${current.triggerReason || '智能充值'}`);
 
       const input = queryPageElements('input')
         .find(el =>
