@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.7.1
+// @version      5.8.0
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -46,6 +46,9 @@
     submitDedupMs: 2 * 60 * 1000, // 提交充值防重复：同账号2分钟内不重复点击“转入”提交。
     maxTaskRetryCount: 3, // 失败任务最多重试次数：单个账号处理失败后最多重新排队3次，超过后记录失败并跳过。
     failedTaskCooldownMs: 30 * 60 * 1000, // 失败冷却时间：超过重试上限的账号30分钟内不再重新加入队列，避免每轮查询都反复失败。
+    arrivalConfirmRatio: 0.8, // 到账核对宽松度：实际余额达到「应有余额」的这个比例即判定到账。
+    arrivalToleranceMin: 5, // 到账核对最小容差，单位元，避免小数和零星消耗导致误判。
+    arrivalConfirmTimeoutMinutes: 25, // 超过这个时间还对不上，才标记「疑似未到账」。
     rechargeLogLimit: 200, // 充值动作日志保留条数：只记已提交、失败、预算未提交、跨天重置这类真实动作。
     skipChangeLogLimit: 200, // 未充值原因变化日志保留条数：同一账号原因不变时只累加轮数，不新增记录。
     scanSnapshotVisibleRows: 6, // 本轮未充值原因默认显示行数，其余点“展开全部”再看。
@@ -105,8 +108,15 @@
 
   const UNGROUPED_ID = 'ungrouped'; // 未分组的固定分组ID，不能删除。
 
+  // 到账核对状态
+  const ARRIVAL_PENDING = 'pending'; // 已提交，等下一轮读余额核对
+  const ARRIVAL_CONFIRMED = 'confirmed'; // 余额对得上，判定到账
+  const ARRIVAL_MISSING = 'missing'; // 超时仍对不上，疑似未到账
+  const ARRIVAL_UNKNOWN = 'unknown'; // 没有余额基准，无法核对
+  const ARRIVAL_NA = 'na'; // 失败或系统记录，不需要核对
+
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.7.1';
+  const SCRIPT_VERSION = '5.8.0';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -114,6 +124,19 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.8.0',
+      date: '2026-08-21',
+      type: 'feature',
+      title: '充值到账核对',
+      items: [
+        '提交记录新增「到账」列：已到账 / 待确认 / 疑似未到账 / 无法核对，并写出判定依据',
+        '判定方式：下一轮读到的余额比充值前高就算到账',
+        '如果这期间花得比充值还多、余额反而下降，会按「充值前余额 − 期间消耗 + 充值金额」再兜一次，避免误报',
+        '同一账号短时间内多笔充值合并核对，超过 25 分钟仍对不上才标「疑似未到账」',
+        '顶部当天汇总：已提交几笔、已到账几笔、待确认几笔、疑似未到账几笔'
+      ]
+    },
     {
       version: '5.7.1',
       date: '2026-08-21',
@@ -1714,6 +1737,10 @@
   function addRechargeLog(task, status) {
     if (!task || !task.accountName) return;
 
+    const finalStatus = status || '已提交';
+    const submitted = String(finalStatus).indexOf('已提交') === 0;
+    const hasBaseline = Number.isFinite(Number(task.balance)) && Number.isFinite(Number(task.spend));
+
     const logs = getRechargeLogs();
     logs.unshift({
       id: makeLogId(),
@@ -1722,12 +1749,122 @@
       amount: task.amount,
       ruleName: task.ruleName || '默认',
       triggerReason: task.triggerReason || '余额/ROI规则',
-      status: status || '已提交'
+      status: finalStatus,
+      // 到账核对用的基准：提交那一刻这个子账号的余额和今日累计花费。
+      balanceBefore: hasBaseline ? Number(task.balance) : null,
+      spendBefore: hasBaseline ? Number(task.spend) : null,
+      arrivalState: submitted ? (hasBaseline ? ARRIVAL_PENDING : ARRIVAL_UNKNOWN) : ARRIVAL_NA,
+      arrivalNote: submitted && !hasBaseline ? '这笔没有余额基准（例如固定时间充值），无法自动核对' : '',
+      arrivalCheckedAt: 0
     });
 
     setRechargeLogs(logs);
     refreshRechargeLogPanel();
     refreshBudgetPanel();
+  }
+
+  // =========================
+  // 到账核对
+  // 主判据：下一轮读到的余额比充值前高，就判定充上了。
+  // 备用判据：这期间花得比充值还多时余额会反而下降，此时用
+  //   应有余额 = 充值前余额 − 期间消耗 + 充值金额
+  // 兜一下，避免把已经到账的误判成没到账。
+  // =========================
+  function isArrivalPendingLog(log) {
+    return !!log && log.arrivalState === ARRIVAL_PENDING;
+  }
+
+  function updateArrivalConfirmations(accounts) {
+    const list = (accounts || []).filter(item => item && item.accountName);
+    if (!list.length) return { confirmed: 0, missing: 0 };
+
+    const logs = getRechargeLogs();
+    const pending = logs.filter(isArrivalPendingLog);
+    if (!pending.length) return { confirmed: 0, missing: 0 };
+
+    const freshByName = new Map();
+    list.forEach(item => freshByName.set(normalizeText(item.accountName), item));
+
+    const now = Date.now();
+    const timeoutMs = CONFIG.arrivalConfirmTimeoutMinutes * 60 * 1000;
+    const byAccount = new Map();
+
+    pending.forEach(log => {
+      const key = normalizeText(log.accountName);
+      if (!byAccount.has(key)) byAccount.set(key, []);
+      byAccount.get(key).push(log);
+    });
+
+    let confirmed = 0;
+    let missing = 0;
+
+    byAccount.forEach((accountLogs, key) => {
+      const fresh = freshByName.get(key);
+      if (!fresh) return; // 本轮没读到这个账号，留到下一轮再核对。
+
+      const ordered = accountLogs.slice().sort((a, b) => Number(a.time) - Number(b.time));
+      const baseline = ordered[0];
+      const balanceBefore = Number(baseline.balanceBefore || 0);
+      const freshBalance = Number(fresh.balance || 0);
+      const freshSpend = Number(fresh.spend || 0);
+      const spendBefore = Number(baseline.spendBefore || 0);
+      const totalAmount = ordered.reduce((sum, log) => sum + Number(log.amount || 0), 0);
+
+      // 主判据：余额比充值前高，就算充上了。
+      const balanceRose = freshBalance > balanceBefore;
+
+      // 备用判据：如果这期间花得比充值还多，余额反而会降，用「应有余额」兜住这种情况。
+      // 跨天后今日花费会归零，拿不到有效消耗差，这时只认主判据。
+      const spendUsable = freshSpend >= spendBefore;
+      const spendDelta = spendUsable ? freshSpend - spendBefore : 0;
+      const expected = balanceBefore - spendDelta + totalAmount;
+      const tolerance = Math.max(CONFIG.arrivalToleranceMin, totalAmount * (1 - CONFIG.arrivalConfirmRatio));
+      const expectedOk = spendUsable && spendDelta > 0 && freshBalance >= expected - tolerance;
+
+      const arrived = balanceRose || expectedOk;
+      const note = balanceRose
+        ? `充值前余额 ${formatMoney(balanceBefore)} 元，现在 ${formatMoney(freshBalance)} 元，余额已上升，已提交 ${formatMoney(totalAmount)} 元`
+        : `充值前余额 ${formatMoney(balanceBefore)} 元，期间消耗 ${formatMoney(spendDelta)} 元，` +
+          `已提交 ${formatMoney(totalAmount)} 元，应有余额约 ${formatMoney(expected)} 元，实际 ${formatMoney(freshBalance)} 元`;
+
+      if (arrived) {
+        ordered.forEach(log => {
+          log.arrivalState = ARRIVAL_CONFIRMED;
+          log.arrivalNote = note;
+          log.arrivalCheckedAt = now;
+        });
+        confirmed += ordered.length;
+        return;
+      }
+
+      ordered.forEach(log => {
+        log.arrivalCheckedAt = now;
+        if (now - Number(log.time || 0) < timeoutMs) {
+          log.arrivalNote = `${note}（还在观察，超过 ${CONFIG.arrivalConfirmTimeoutMinutes} 分钟仍对不上才会标记）`;
+          return;
+        }
+        log.arrivalState = ARRIVAL_MISSING;
+        log.arrivalNote = `${note}。超过 ${CONFIG.arrivalConfirmTimeoutMinutes} 分钟仍对不上，请到京准通后台核对这一笔`;
+        missing += 1;
+      });
+    });
+
+    if (confirmed || missing) {
+      setRechargeLogs(logs);
+      refreshRechargeLogPanel();
+    } else {
+      setRechargeLogs(logs);
+    }
+
+    return { confirmed, missing };
+  }
+
+  function arrivalStateMeta(state) {
+    if (state === ARRIVAL_CONFIRMED) return { text: '已到账', bg: '#dcfce7', color: '#15803d' };
+    if (state === ARRIVAL_MISSING) return { text: '疑似未到账', bg: '#fef3c7', color: '#b45309' };
+    if (state === ARRIVAL_PENDING) return { text: '待确认', bg: '#e2e8f0', color: '#475569' };
+    if (state === ARRIVAL_UNKNOWN) return { text: '无法核对', bg: '#f1f5f9', color: '#94a3b8' };
+    return { text: '—', bg: 'transparent', color: '#94a3b8' };
   }
 
   // =========================
@@ -3642,6 +3779,33 @@
     return { text: '系统', bg: '#dbeafe', color: '#1e40af' };
   }
 
+  function rechargeLogTodaySummaryHtml() {
+    const today = todayKey();
+    const todayLogs = getRechargeLogs().filter(log => log && todayKeyFromTime(log.time) === today);
+
+    if (!todayLogs.length) {
+      return '<div style="padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;color:#64748b;line-height:1.6;margin-bottom:8px;">今天还没有充值动作记录。</div>';
+    }
+
+    const submitted = todayLogs.filter(log => rechargeLogKind(log) === 'ok');
+    const failed = todayLogs.filter(log => rechargeLogKind(log) === 'fail');
+    const amount = submitted.reduce((sum, log) => sum + Number(log.amount || 0), 0);
+    const confirmed = submitted.filter(log => log.arrivalState === ARRIVAL_CONFIRMED);
+    const missing = submitted.filter(log => log.arrivalState === ARRIVAL_MISSING);
+    const pending = submitted.filter(log => log.arrivalState === ARRIVAL_PENDING);
+    const confirmedAmount = confirmed.reduce((sum, log) => sum + Number(log.amount || 0), 0);
+
+    return `
+      <div style="padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;color:#334155;line-height:1.7;margin-bottom:8px;">
+        今天到账核对：已提交 ${escapeHtml(submitted.length)} 笔 / ${escapeHtml(formatMoney(amount))} 元，
+        <b style="color:#15803d;">已到账 ${escapeHtml(confirmed.length)} 笔 / ${escapeHtml(formatMoney(confirmedAmount))} 元</b>，
+        待确认 ${escapeHtml(pending.length)} 笔，
+        <b style="color:${missing.length ? '#b45309' : '#64748b'};">疑似未到账 ${escapeHtml(missing.length)} 笔</b>
+        ${missing.length ? '<br><span style="color:#b45309;">疑似未到账的这几笔请到京准通后台核对一下。</span>' : ''}
+      </div>
+    `;
+  }
+
   function rechargeLogFilterHtml() {
     const items = [
       { id: 'all', label: '全部' },
@@ -3666,14 +3830,16 @@
 
     if (!logs.length) {
       return `
+        ${rechargeLogTodaySummaryHtml()}
         ${rechargeLogFilterHtml()}
         <div style="padding:10px;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;">
-          ${rechargeLogFilter === 'all' ? '暂无充值动作记录' : '当前筛选下没有记录'}
+          ${rechargeLogFilter === 'all' ? '暂无充值动作记录' : '当前筛选下没有记录，点上面的「全部」看全部'}
         </div>
       `;
     }
 
     return `
+      ${rechargeLogTodaySummaryHtml()}
       ${rechargeLogFilterHtml()}
       <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e5e5;font-size:12px;">
         <thead>
@@ -3682,12 +3848,14 @@
             <th style="text-align:left;padding:6px;border-bottom:1px solid #eee;">子账号</th>
             <th style="text-align:right;padding:6px;border-bottom:1px solid #eee;">金额</th>
             <th style="text-align:left;padding:6px;border-bottom:1px solid #eee;">规则/来源</th>
-            <th style="text-align:left;padding:6px;border-bottom:1px solid #eee;">状态</th>
+            <th style="text-align:left;padding:6px;border-bottom:1px solid #eee;">动作</th>
+            <th style="text-align:left;padding:6px;border-bottom:1px solid #eee;">到账</th>
           </tr>
         </thead>
         <tbody>
           ${logs.map(log => {
             const meta = rechargeLogKindMeta(rechargeLogKind(log));
+            const arrival = arrivalStateMeta(log.arrivalState);
             return `
             <tr>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;white-space:nowrap;">${escapeHtml(formatDateTime(log.time))}</td>
@@ -3695,6 +3863,10 @@
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;text-align:right;">${escapeHtml(log.amount)}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;">${escapeHtml(log.ruleName)} / ${escapeHtml(log.triggerReason)}</td>
               <td style="padding:6px;border-bottom:1px solid #f0f0f0;white-space:nowrap;"><span style="padding:2px 8px;border-radius:999px;background:${meta.bg};color:${meta.color};font-weight:700;">${escapeHtml(log.status || '已提交')}</span></td>
+              <td style="padding:6px;border-bottom:1px solid #f0f0f0;">
+                <span style="padding:2px 8px;border-radius:999px;background:${arrival.bg};color:${arrival.color};font-weight:700;white-space:nowrap;">${escapeHtml(arrival.text)}</span>
+                ${log.arrivalNote ? `<div style="color:#94a3b8;margin-top:3px;line-height:1.5;">${escapeHtml(log.arrivalNote)}</div>` : ''}
+              </td>
             </tr>
           `;
           }).join('')}
@@ -6209,6 +6381,11 @@
     if (CONFIG.autoSyncAccountRoster && list.length) {
       mergeAccountsIntoRoster(list); // 名单跟着每轮查询更新，余额和投产保持最新。
       refreshAccountRosterPanel();
+    }
+
+    const arrival = updateArrivalConfirmations(list); // 用本轮余额核对上一轮提交的充值有没有到账。
+    if (arrival.missing > 0) {
+      showStatus(`到账核对：有 ${arrival.missing} 笔提交超过 ${CONFIG.arrivalConfirmTimeoutMinutes} 分钟仍对不上余额，请到京准通后台核对。详见「提交记录」。`);
     }
 
     const decisions = list.map(account => ({ account, result: decideAccountRecharge(account) }));
