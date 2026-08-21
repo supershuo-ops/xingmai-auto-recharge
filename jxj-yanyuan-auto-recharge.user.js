@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.8.0
+// @version      5.8.1
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -40,7 +40,9 @@
     assignUrl: 'https://jzt.jd.com/account/#/assign', // 京准通“投放账户分配金额”页面地址，一般不要改。
     nextAccountDelayMs: 7000, // 一个账号提交后等7秒再处理下一个账号，防止页面抽屉/确认框还没收起。
     assignPollMs: 3000, // 充值页轮询间隔：每3秒检查一次有没有待充值任务。
-    assignAliveMs: 15000, // 充值页存活标记：15秒内检测到充值页在线，就不重复打开新充值窗口。
+    assignAliveMs: 30000, // 充值页存活标记：30秒内检测到充值页在线，就不重复打开新充值窗口。
+    assignForegroundWaitMs: 90 * 1000, // 充值页在后台时，最多等90秒切到前台再填金额，避免浏览器拖慢定时器。
+    assignOpenDrawerRetries: 3, // 点列表「转入」后如果金额框没出来，最多再点3次。
     taskQueueLockMs: 10 * 1000, // 写入充值任务队列时的锁，10秒内防止多个页面同时写队列。
     taskDedupMs: 2 * 60 * 1000, // 加入任务防重复：同账号2分钟内不重复加入充值队列。
     submitDedupMs: 2 * 60 * 1000, // 提交充值防重复：同账号2分钟内不重复点击“转入”提交。
@@ -116,7 +118,7 @@
   const ARRIVAL_NA = 'na'; // 失败或系统记录，不需要核对
 
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.8.0';
+  const SCRIPT_VERSION = '5.8.1';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -124,6 +126,20 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.8.1',
+      date: '2026-08-21',
+      type: 'fix',
+      title: '充值页更稳地找到账号并写入金额',
+      items: [
+        '充值页只认带「转入」的平台账号行，避免工作台表格里的同名账号把查找带偏',
+        '处理任务时自动收起工作台，减少自己的界面挡住或干扰京准通页面',
+        '充值页如果在后台，会先提示切到前台再填金额，避免浏览器拖慢后金额框还没出来就放弃',
+        '金额框认法放宽：数字框、可分配金额、Ant 金额组件都能找到',
+        '点「转入」后如果金额框没出来会再点几次；写入后回读校验，没写进去就重试',
+        '每一步失败都会写到「充值页状态」，方便对照是找不到行、找不到框，还是数字没吃进去'
+      ]
+    },
     {
       version: '5.8.0',
       date: '2026-08-21',
@@ -514,14 +530,37 @@
   }
 
   function setInputValue(input, value) {
-    input.focus();
+    if (!input) return;
+    const text = String(value);
 
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(input, String(value));
+    try { input.focus(); } catch (e) {}
+    try { input.click(); } catch (e) {}
+
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    if (setter && setter.set) setter.set.call(input, text);
+    input.value = text;
 
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    try {
+      input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        data: text,
+        inputType: 'insertText'
+      }));
+    } catch (e) {}
+    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '0' }));
+  }
+
+  function readInputValue(input) {
+    return String(input && input.value != null ? input.value : '').replace(/[,\s]/g, '').trim();
+  }
+
+  function inputValueMatchesAmount(input, amount) {
+    const got = Number(readInputValue(input));
+    const expected = Number(amount);
+    return Number.isFinite(got) && Number.isFinite(expected) && got === expected;
   }
 
   function dedupeTasksByAccount(tasks) {
@@ -5190,6 +5229,14 @@
     switchWorkspacePage(pageId || activeWorkspacePage || 'overview');
   }
 
+  function collapseWorkspaceQuietly() {
+    const panel = document.getElementById('jxj-rule-panel');
+    if (!panel || panel.style.display === 'none') return false;
+    rulePanelVisible = false;
+    panel.style.display = 'none';
+    return true;
+  }
+
   function addBlankRuleToPanel(panel, matchType) {
     const shopWide = matchType === 'all';
     const rules = readRulesFromPanel(panel);
@@ -6588,8 +6635,30 @@
     return false;
   }
 
+  function getRowCandidateNames(row) {
+    return getCells(row)
+      .map(cell => String(cell || '').split('\n')[0].trim())
+      .filter(name => name && name !== '转入' && name !== '转出' && name !== '操作');
+  }
+
+  function rowHasTransferAction(row) {
+    if (!row || isScriptUiNode(row)) return false;
+    return [...row.querySelectorAll('a, button, span, div')].some(el => {
+      if (el.offsetParent === null) return false;
+      return normalizeText(el.innerText) === '转入';
+    });
+  }
+
+  function rowMatchesAccount(row, accountName) {
+    if (sameAccount(getAccountName(row), accountName)) return true;
+    return getRowCandidateNames(row).some(name => sameAccount(name, accountName));
+  }
+
   function findExactAccountRow(accountName) {
-    return getVisibleRows().find(row => sameAccount(getAccountName(row), accountName));
+    const rows = getVisibleRows();
+    const withTransfer = rows.filter(rowHasTransferAction);
+    const pool = withTransfer.length ? withTransfer : rows;
+    return pool.find(row => rowMatchesAccount(row, accountName)) || null;
   }
 
   async function clickAssignSearch(input) {
@@ -6621,12 +6690,9 @@
     for (let i = 0; i < 40; i++) { // 最多等待精确账号搜索结果40秒。
       const exactRow = findExactAccountRow(accountName);
 
-      if (exactRow) {
-        const foundName = getAccountName(exactRow);
-        if (sameAccount(foundName, accountName)) {
-          showStatus(`已精确找到账号：${accountName}`);
-          return exactRow;
-        }
+      if (exactRow && rowMatchesAccount(exactRow, accountName)) {
+        showStatus(`已精确找到账号：${accountName}`);
+        return exactRow;
       }
 
       showStatus(`等待精确账号搜索结果：${accountName}... ${i + 1}/40`);
@@ -6699,20 +6765,36 @@
     );
   }
 
+  function isAccountSearchInput(el) {
+    const ph = String((el && el.placeholder) || '');
+    return ph.includes('投放账户') || ph.includes('账户名称') || ph.includes('账户ID') || ph.includes('输入ID');
+  }
+
+  function isLikelyAmountInput(el) {
+    if (!el || isScriptUiNode(el) || isAccountSearchInput(el)) return false;
+    if (el.disabled) return false;
+    if (el.offsetParent === null) return false;
+
+    const ph = String(el.placeholder || '');
+    const type = String(el.type || '').toLowerCase();
+    const cls = String(el.className || '');
+    const name = String(el.name || el.id || '');
+
+    if (type === 'number' || type === 'tel') return true;
+    if (cls.indexOf('ant-input-number') >= 0) return true;
+    if (ph.includes('可分配金额') || ph.includes('输入金额') || ph.includes('金额')) return true;
+    if (/amount|money|price|transfer|fenpei|alloc/i.test(name)) return true;
+    return false;
+  }
+
+  function collectAmountInputs() {
+    const inputs = queryPageElements(['input', '.ant-input-number-input']).filter(isLikelyAmountInput);
+    return [...new Set(inputs)];
+  }
+
   async function waitForAmountInput(accountName) {
     for (let i = 0; i < 30; i++) { // 最多等待右侧金额输入框30秒。
-      const inputs = queryPageElements('input').filter(el =>
-        el.offsetParent !== null
-      );
-
-      const amountInputs = inputs.filter(el =>
-        el.placeholder &&
-        (
-          el.placeholder.includes('可分配金额') ||
-          el.placeholder.includes('输入金额') ||
-          el.placeholder.includes('金额')
-        )
-      );
+      const amountInputs = collectAmountInputs();
 
       for (const amountInput of amountInputs) {
         if (!accountName || isTransferPanelForAccount(amountInput, accountName)) {
@@ -6729,6 +6811,62 @@
     }
 
     return null;
+  }
+
+  async function fillAmountInput(amountInput, amount) {
+    const expected = String(amount);
+    for (let i = 0; i < 4; i++) {
+      setInputValue(amountInput, expected);
+      await sleep(350);
+      if (inputValueMatchesAmount(amountInput, expected)) return true;
+      showStatus(`金额未写入，重试 ${i + 1}/4，当前框内=${readInputValue(amountInput) || '空'}`);
+    }
+    return inputValueMatchesAmount(amountInput, expected);
+  }
+
+  function isAssignTabHidden() {
+    try {
+      return !!(document.hidden || document.visibilityState === 'hidden');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function waitUntilTabVisible(maxMs) {
+    if (!isAssignTabHidden()) return Promise.resolve(true);
+
+    const limit = Math.max(1000, Number(maxMs || CONFIG.assignForegroundWaitMs || 90000));
+    return new Promise(resolve => {
+      let done = false;
+      const finish = ok => {
+        if (done) return;
+        done = true;
+        document.removeEventListener('visibilitychange', onVisible);
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const onVisible = () => {
+        if (!isAssignTabHidden()) finish(true);
+      };
+      document.addEventListener('visibilitychange', onVisible);
+      const timer = setTimeout(() => finish(false), limit);
+      try { window.focus(); } catch (e) {}
+    });
+  }
+
+  async function ensureAssignTabForeground(accountName) {
+    if (!isAssignTabHidden()) return true;
+
+    setAssignState(`充值页在后台，等待切到前台后再填 ${accountName || '金额'}。请点开京准通这个标签页。`);
+    showStatus('充值页在后台，浏览器会拖慢脚本。请点开这个京准通标签页，否则可能填不了金额。');
+    const ok = await waitUntilTabVisible(CONFIG.assignForegroundWaitMs);
+    if (ok) {
+      showStatus('已回到前台，继续充值');
+      return true;
+    }
+
+    setAssignState('充值页仍在后台，继续尝试填写，可能较慢或不稳定');
+    return false;
   }
 
   async function waitDrawerAccount(accountName, amountInput) {
@@ -6868,6 +7006,9 @@
         return;
       }
 
+      collapseWorkspaceQuietly();
+      await ensureAssignTabForeground(current.accountName);
+
       const budgetGate = gateTaskByDailyBudget(current);
       if (budgetGate.skip) {
         showStatus(`受当日推广预算限制，跳过 ${current.accountName}：${budgetGate.reason}`);
@@ -6905,6 +7046,7 @@
         );
 
       if (!input) {
+        setAssignState('没有找到账号搜索框。请确认停在京准通「投放账户分配金额」页。');
         showStatus('没有找到账号搜索框');
         if (await retryOrContinueCurrentTask(current, '没有找到账号搜索框')) continue;
         return;
@@ -6917,6 +7059,7 @@
       const targetRow = await waitForExactTargetRow(accountName);
 
       if (!targetRow) {
+        setAssignState(`没有精确找到账号 ${accountName}。请看搜索结果里有没有这一行，以及这一行有没有「转入」。`);
         showStatus(`安全停止：没有精确找到账号 ${accountName}`);
         if (await retryOrContinueCurrentTask(current, `没有精确找到账号 ${accountName}`)) continue;
         return;
@@ -6924,26 +7067,36 @@
 
       const rowAccountName = getAccountName(targetRow);
 
-      if (!sameAccount(rowAccountName, accountName)) {
+      if (!sameAccount(rowAccountName, accountName) && !rowMatchesAccount(targetRow, accountName)) {
+        setAssignState(`目标账号不一致。目标=${accountName}，页面=${rowAccountName}`);
         showStatus(`安全停止：目标账号不一致。目标=${accountName}，页面=${rowAccountName}`);
         if (await retryOrContinueCurrentTask(current, `目标账号不一致，页面显示为 ${rowAccountName}`)) continue;
         return;
       }
 
-      const transferIn = [...targetRow.querySelectorAll('a, button, span')]
+      const transferIn = [...targetRow.querySelectorAll('a, button, span, div')]
         .find(el => el.innerText && normalizeText(el.innerText) === '转入');
 
       if (!transferIn) {
+        setAssignState(`找到了账号 ${accountName}，但这一行没有「转入」按钮`);
         showStatus(`找到了精确账号，但没有找到列表里的转入按钮：${accountName}`);
         if (await retryOrContinueCurrentTask(current, `没有找到列表里的转入按钮：${accountName}`)) continue;
         return;
       }
 
-      simpleClick(transferIn);
-
-      const amountInput = await waitForAmountInput(accountName);
+      const openTries = Math.max(1, Number(CONFIG.assignOpenDrawerRetries || 3));
+      let amountInput = null;
+      for (let attempt = 0; attempt < openTries && !amountInput; attempt++) {
+        if (attempt > 0) {
+          setAssignState(`金额框还没出来，第 ${attempt + 1}/${openTries} 次点转入：${accountName}`);
+          showStatus(`金额框还没出来，重新点击列表转入：${accountName}（${attempt + 1}/${openTries}）`);
+        }
+        simpleClick(transferIn);
+        amountInput = await waitForAmountInput(accountName);
+      }
 
       if (!amountInput) {
+        setAssignState(`点了转入，但没有找到金额输入框：${accountName}。可能弹层还没出来，或金额框不是普通输入框。`);
         showStatus(`没有找到金额输入框：${accountName}`);
         if (await retryOrContinueCurrentTask(current, `没有找到金额输入框：${accountName}`)) continue;
         return;
@@ -6952,6 +7105,7 @@
       const drawerOk = await waitDrawerAccount(accountName, amountInput);
 
       if (!drawerOk) {
+        setAssignState(`打开的转入面板不是目标账号 ${accountName}`);
         showStatus(`安全停止：打开的转入面板不是目标账号 ${accountName}`);
         if (await retryOrContinueCurrentTask(current, `打开的转入面板不是目标账号 ${accountName}`)) continue;
         return;
@@ -6970,6 +7124,7 @@
       const submitGuardAcquired = await acquireAccountSubmitGuard(accountName);
 
       if (!submitGuardAcquired) {
+        setAssignState(`防重复充值：${accountName} 近期已提交过，本次跳过`);
         showStatus(`防重复充值：${accountName} 近期已有同账号充值正在处理或已提交，本次跳过重复任务`);
         clearCurrent();
         refreshQueuePanel();
@@ -6986,9 +7141,16 @@
         return;
       }
 
-      setInputValue(amountInput, amount);
+      const filled = await fillAmountInput(amountInput, amount);
+      if (!filled) {
+        releaseAccountSubmitGuard(accountName);
+        setAssignState(`金额框在，但数字没写进去：${accountName}，目标 ${amount} 元，当前框内 ${readInputValue(amountInput) || '空'}`);
+        showStatus(`金额没有成功写入输入框：${accountName}`);
+        if (await retryOrContinueCurrentTask(current, `金额没有成功写入输入框：${accountName}`)) continue;
+        return;
+      }
 
-      await sleep(1000); // 金额填入后等1秒，让页面识别输入值。
+      await sleep(400); // 金额回读通过后再稍等，让页面识别输入值。
 
       if (!isCurrentTaskStillActive(current)) {
         releaseAccountSubmitGuard(accountName);
@@ -7006,6 +7168,7 @@
 
       if (!submitted) {
         releaseAccountSubmitGuard(accountName);
+        setAssignState(`金额已填入，但没有点到右侧「转入」：${accountName}`);
         showStatus(`没有成功点击右侧转入按钮：${accountName}`);
         if (await retryOrContinueCurrentTask(current, `没有成功点击右侧转入按钮：${accountName}`)) continue;
         return;
