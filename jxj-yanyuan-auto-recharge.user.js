@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星脉自动充值
 // @namespace    local.jxj.yanyuan.auto-recharge-full
-// @version      5.7.0
+// @version      5.7.1
 // @description  数据看板工作台：子账号分时充值、店铺当天预算、分时上限、队列、提交记录和版本中心
 // @match        *://jxj.hnyjyx.cn/*
 // @match        *://*.hnyjyx.cn/*
@@ -101,11 +101,12 @@
   const STORAGE_SKIP_REASON_CHANGES = 'jxj_yanyuan_recharge_skip_reason_changes_auto_v23';
   const STORAGE_ACCOUNT_ROSTER = 'jxj_yanyuan_recharge_account_roster_auto_v23';
   const STORAGE_ACCOUNT_GROUPS = 'jxj_yanyuan_recharge_account_groups_auto_v23';
+  const STORAGE_ASSIGN_STATE = 'jxj_yanyuan_recharge_assign_state_auto_v23';
 
   const UNGROUPED_ID = 'ungrouped'; // 未分组的固定分组ID，不能删除。
 
   const TAB_ID = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
-  const SCRIPT_VERSION = '5.7.0';
+  const SCRIPT_VERSION = '5.7.1';
   const SCRIPT_DISPLAY_NAME = '星脉自动充值';
   const SCRIPT_NAME = SCRIPT_DISPLAY_NAME + ' v' + SCRIPT_VERSION;
   const SCRIPT_UPDATE_URL = 'https://raw.githubusercontent.com/supershuo-ops/xingmai-auto-recharge/main/jxj-yanyuan-auto-recharge.user.js';
@@ -113,6 +114,17 @@
   // 每次发版：只提高 @version 和 SCRIPT_VERSION，并在 VERSION_HISTORY 追加一条。
   // 不要改 @name / @namespace，否则油猴会当成新脚本，自动更新和本机规则/设置都会断。
   const VERSION_HISTORY = [
+    {
+      version: '5.7.1',
+      date: '2026-08-21',
+      type: 'fix',
+      title: '修复队列有任务但充值页不充的问题',
+      items: [
+        '扫平台页面时排除工作台自己的表格，之前工作台里第一列是账号名的表格会被当成平台页面的行',
+        '充值队列页新增「充值页状态」：能看到充值页在处理谁、是不是被暂停或模拟运行挡住、有没有在运行',
+        '队列里有任务但检测不到充值页时，会直接给出橙色提醒'
+      ]
+    },
     {
       version: '5.7.0',
       date: '2026-08-20',
@@ -547,6 +559,18 @@
 
   function hasPendingTask() {
     return !!getCurrent() || getQueue().length > 0;
+  }
+
+  // 记录充值页当前在干什么，方便队列卡住时一眼看出是哪一步停下的。
+  function setAssignState(text) {
+    writeJsonValue(STORAGE_ASSIGN_STATE, { time: Date.now(), text: String(text || '') });
+    refreshQueuePanel();
+  }
+
+  function getAssignState() {
+    const saved = readJsonValue(STORAGE_ASSIGN_STATE, null);
+    if (!saved || !saved.time) return null;
+    return saved;
   }
 
   function queueHasAccount(queue, accountName) {
@@ -3742,9 +3766,41 @@
     `;
   }
 
+  function assignStateHtml() {
+    const state = getAssignState();
+    const alive = isAssignPageAlive();
+    const queued = hasPendingTask();
+
+    if (!alive && queued) {
+      return `
+        <div style="padding:9px 10px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:12px;color:#92400e;line-height:1.6;">
+          <b>充值页没有在运行</b>：队列里有任务，但没检测到京准通「投放账户分配金额」页。
+          请确认那个标签页还开着、已登录，并且脚本在上面跑起来了（页面上应能看到蓝色状态提示）。
+          ${state ? `<br>充值页最后一次动作：${escapeHtml(state.text)}（${escapeHtml(formatDateTime(state.time))}）` : ''}
+        </div>
+      `;
+    }
+
+    if (!state) {
+      return '<div style="padding:9px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:12px;color:#64748b;">充值页还没有上报状态。</div>';
+    }
+
+    const stale = Date.now() - Number(state.time || 0) > 5 * 60 * 1000;
+    return `
+      <div style="padding:9px 10px;background:${stale ? '#fffbeb' : '#eff6ff'};border:1px solid ${stale ? '#fde68a' : '#bfdbfe'};border-radius:8px;font-size:12px;color:${stale ? '#92400e' : '#1e3a8a'};line-height:1.6;">
+        <b>充值页状态</b>：${escapeHtml(state.text)}
+        <br>更新于 ${escapeHtml(formatDateTime(state.time))}${stale ? '（超过 5 分钟没动静，建议看一下那个标签页）' : ''}
+      </div>
+    `;
+  }
+
   function refreshQueuePanel() {
     const box = document.getElementById('jxj-pending-queue-rows');
     if (box) box.innerHTML = pendingQueueHtml();
+
+    const stateBox = document.getElementById('jxj-assign-state');
+    if (stateBox) stateBox.innerHTML = assignStateHtml();
+
     refreshBudgetPanel();
   }
 
@@ -5493,6 +5549,7 @@
                       <button type="button" data-action="clear-queue" style="padding:5px 8px;border:1px solid #ff7875;background:#fff;color:#cf1322;border-radius:4px;cursor:pointer;">清空</button>
                     </div>
                   </div>
+                  <div id="jxj-assign-state" style="margin-bottom:8px;">${assignStateHtml()}</div>
                   <div id="jxj-pending-queue-rows">${pendingQueueHtml()}</div>
                 </div>
               </div>
@@ -5767,14 +5824,35 @@
     return false;
   }
 
-  function getVisibleRows() {
-    const rows = [
-      ...document.querySelectorAll('table tbody tr'),
-      ...document.querySelectorAll('.el-table__body-wrapper tbody tr'),
-      ...document.querySelectorAll('.ant-table-tbody tr')
-    ];
+  // 工作台面板和状态框也在同一个页面里。扫平台页面元素时必须排除它们，
+  // 否则「本轮未充值原因」「单个账号额度」这些表格的第一列也是账号名，会被当成平台页面的行。
+  const SCRIPT_UI_SELECTOR = '#jxj-rule-panel, #jxj-auto-status-box, #jxj-rule-panel-toggle, #jxj-recharge-log-toggle';
 
-    return [...new Set(rows)].filter(row => {
+  function isScriptUiNode(node) {
+    if (!node || typeof node.closest !== 'function') return false;
+    return !!node.closest(SCRIPT_UI_SELECTOR);
+  }
+
+  function queryPageElements(selectors) {
+    const list = [];
+
+    (Array.isArray(selectors) ? selectors : [selectors]).forEach(selector => {
+      document.querySelectorAll(selector).forEach(el => {
+        if (!isScriptUiNode(el)) list.push(el);
+      });
+    });
+
+    return [...new Set(list)];
+  }
+
+  function getVisibleRows() {
+    const rows = queryPageElements([
+      'table tbody tr',
+      '.el-table__body-wrapper tbody tr',
+      '.ant-table-tbody tr'
+    ]);
+
+    return rows.filter(row => {
       const rect = row.getBoundingClientRect();
       return row.offsetParent !== null &&
         rect.width > 0 &&
@@ -5990,11 +6068,7 @@
     await waitNoProcessingToast();
 
     for (let i = 0; i < 20; i++) { // 最多找搜索按钮20秒。
-      const btn = [
-        ...document.querySelectorAll('button'),
-        ...document.querySelectorAll('a'),
-        ...document.querySelectorAll('span')
-      ].find(el =>
+      const btn = queryPageElements(['button', 'a', 'span']).find(el =>
         normalizeText(el.innerText) === '搜索' &&
         el.offsetParent !== null
       );
@@ -6317,7 +6391,7 @@
 
   async function waitAssignPageReady() {
     for (let i = 0; i < 50; i++) { // 最多等待充值页加载50秒，找到账户搜索框和表格才继续。
-      const hasInput = [...document.querySelectorAll('input')].some(el =>
+      const hasInput = queryPageElements('input').some(el =>
         el.placeholder &&
         (
           el.placeholder.includes('投放账户') ||
@@ -6450,7 +6524,7 @@
 
   async function waitForAmountInput(accountName) {
     for (let i = 0; i < 30; i++) { // 最多等待右侧金额输入框30秒。
-      const inputs = [...document.querySelectorAll('input')].filter(el =>
+      const inputs = queryPageElements('input').filter(el =>
         el.offsetParent !== null
       );
 
@@ -6497,11 +6571,7 @@
   function findDrawerTransferButton(amountInput) {
     const inputRect = amountInput.getBoundingClientRect();
 
-    const candidates = [
-      ...document.querySelectorAll('button'),
-      ...document.querySelectorAll('a'),
-      ...document.querySelectorAll('span')
-    ].filter(el => {
+    const candidates = queryPageElements(['button', 'a', 'span']).filter(el => {
       if (el.offsetParent === null) return false;
 
       const text = normalizeText(el.innerText);
@@ -6519,11 +6589,8 @@
 
   async function clickConfirmIfAny() {
     for (let i = 0; i < 10; i++) { // 点“转入”后最多找确认按钮10次。
-      const btn = [
-        ...document.querySelectorAll('button'),
-        ...document.querySelectorAll('a'),
-        ...document.querySelectorAll('span')
-      ].filter(el => el.offsetParent !== null)
+      const btn = queryPageElements(['button', 'a', 'span'])
+        .filter(el => el.offsetParent !== null)
         .find(el => {
           const text = normalizeText(el.innerText);
           return text === '确定' || text === '确认';
@@ -6572,11 +6639,13 @@
     markAssignPageReady();
 
     if (isPaused()) {
+      setAssignState('已暂停自动充值，充值页不处理任务。到「运行设置」取消勾选「暂停自动充值」。');
       showStatus('已暂停自动充值：充值页不处理待充值任务');
       return;
     }
 
     if (isDryRun()) {
+      setAssignState('模拟运行中，充值页只看不充。到「运行设置」取消勾选「模拟运行」。');
       showStatus('模拟运行中：充值页不处理待充值任务');
       return;
     }
@@ -6584,6 +6653,7 @@
     if (isAssigning) return;
 
     if (!acquireAssignLock()) {
+      setAssignState('另一个充值页正在处理任务，本页等待。多开了充值页就关掉多余的。');
       showStatus('另一个充值页正在处理任务，本页等待');
       return;
     }
@@ -6606,13 +6676,16 @@
       let current = popNextToCurrentIfNeeded();
 
       if (!current) {
+        setAssignState('充值页空闲，没有待充值账号');
         showStatus('分配金额页面：没有待充值账号');
         return;
       }
 
+      setAssignState(`正在处理 ${current.accountName}，金额 ${current.amount} 元`);
       const ready = await waitAssignPageReady();
 
       if (!ready) {
+        setAssignState('充值页加载超时：没找到账户搜索框或表格。请确认已登录并停在「投放账户分配金额」页。');
         showStatus('分配金额页面加载超时');
         if (await retryOrContinueCurrentTask(current, '分配金额页面加载超时')) continue;
         return;
@@ -6644,7 +6717,7 @@
 
       showStatus(`正在自动充值：${accountName}，${amount}元\n规则：${current.ruleName || '默认'}\n原因：${current.triggerReason || '余额/ROI规则'}`);
 
-      const input = [...document.querySelectorAll('input')]
+      const input = queryPageElements('input')
         .find(el =>
           el.placeholder &&
           (
@@ -6762,6 +6835,7 @@
       }
 
       markAccountSubmitFinished(accountName);
+      setAssignState(`已提交 ${accountName}，${amount} 元`);
       addRechargeLog(current);
       submittedTasks.push(Object.assign({}, current));
       markRuleDone(current);
@@ -6805,6 +6879,7 @@
 
       if (Date.now() - lastAssignIdleStatus > 30000) {
         lastAssignIdleStatus = Date.now();
+        setAssignState('充值页已打开，等待京小洁页面投递任务');
         showStatus('充值页已打开，等待京小洁页面投递任务');
       }
     }, CONFIG.assignPollMs);
